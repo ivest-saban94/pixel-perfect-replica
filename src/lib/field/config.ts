@@ -1,5 +1,11 @@
 export type TruckId = "615-41-002" | "651-51-701";
-export interface Truck { id: TruckId; driver: string; driverAr: string; type: "crane" | "distribution"; maxTons: number }
+export interface Truck {
+  id: TruckId;
+  driver: string;
+  driverAr: string;
+  type: "crane" | "distribution";
+  maxTons: number;
+}
 export const TRUCKS: Truck[] = [
   { id: "615-41-002", driver: "חכמת גאבר", driverAr: "حكمت جابر", type: "crane", maxTons: 10.2 },
   { id: "651-51-701", driver: "עלי", driverAr: "علي", type: "distribution", maxTons: 4.46 },
@@ -11,14 +17,37 @@ export const DEPOSIT_ITEMS = [
 ] as const;
 export const TZ = "Asia/Jerusalem";
 export const DRIVE_FOLDER = "בירור_תעודות_משלוח_ראמי";
+export const SHEET_ID_MAIN = "1FsLseQrKbIj_AvlE6-dW4J12Gr88P3uaoFVBjEcUjsw";
+
+export const TRUCK_EMAILS: Record<TruckId, string> = {
+  "615-41-002": "galya@saban94.co.il",
+  "651-51-701": "lina@saban94.co.il",
+};
+
+export function emailForTruck(truck: TruckId | string): string {
+  return (TRUCK_EMAILS as Record<string, string>)[truck] ?? "galya@saban94.co.il";
+}
+
+export function driverNameForTruck(truck: TruckId | string): string {
+  return TRUCKS.find((x) => x.id === truck)?.driver ?? truck;
+}
 
 /** YYYYMMDD in Asia/Jerusalem */
 export function jerusalemDate(d = new Date()): string {
-  const p = new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+  const p = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
   return p.replaceAll("-", "");
 }
 export function jerusalemTime(d: Date | number = new Date()): string {
-  return new Intl.DateTimeFormat("he-IL", { timeZone: TZ, hour: "2-digit", minute: "2-digit" }).format(d);
+  return new Intl.DateTimeFormat("he-IL", {
+    timeZone: TZ,
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(d);
 }
 export function podFileName(docNumber: string, customer: string, d = new Date()): string {
   const clean = (s: string) => s.trim().replace(/[\\/:*?"<>|\s]+/g, "_");

@@ -4,7 +4,7 @@ import { useField } from "@/components/field/FieldContext";
 import { BigInput, PhotoButton, Shell } from "@/components/field/Shell";
 import { enqueue, kvGet, kvSet } from "@/lib/field/db";
 import { enhanceDocument, pagesToPdf } from "@/lib/field/imaging";
-import { DRIVE_FOLDER, overWeight, podFileName, uniqueKey } from "@/lib/field/config";
+import { DRIVE_FOLDER, SHEET_ID_MAIN, emailForTruck, overWeight, podFileName, uniqueKey } from "@/lib/field/config";
 
 export const Route = createFileRoute("/pod")({
   head: () => ({ meta: [
@@ -31,9 +31,9 @@ function Pod() {
     const pdf = await pagesToPdf(pages);
     const fileName = podFileName(doc, cust);
     await enqueue("pod", uniqueKey(doc), {
-      truck: f.truck!.id, docNumber: doc, customer: cust, tons: tons ? Number(tons) : null,
+      truck: f.truck!.id, driver: f.truck!.driver, docNumber: doc, customer: cust, tons: tons ? Number(tons) : null,
       overrideCode: heavy ? code : null, fileName, folder: DRIVE_FOLDER, pdf, at: Date.now(),
-      sheet: "ארכיון_תעודות_גליה", notify: { whatsapp: true, email: "galya@saban94.co.il" },
+      sheetId: SHEET_ID_MAIN, sheet: "ארכיון_תעודות_גליה", notify: { whatsapp: true, email: emailForTruck(f.truck!.id) },
     });
     await kvSet("podCount", ((await kvGet<number>("podCount")) ?? 0) + 1);
     f.confirm(); setPages([]); setDoc(""); setCust(""); setTons(""); setCode(""); setBusy(false);

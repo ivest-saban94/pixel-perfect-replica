@@ -4,7 +4,7 @@ import { useField } from "@/components/field/FieldContext";
 import { BigInput, PhotoButton, Shell } from "@/components/field/Shell";
 import { enqueue, kvGet, kvSet } from "@/lib/field/db";
 import { photoToDataUrl } from "@/lib/field/imaging";
-import { DEPOSIT_ITEMS, uniqueKey } from "@/lib/field/config";
+import { DEPOSIT_ITEMS, DRIVE_FOLDER, SHEET_ID_MAIN, emailForTruck, jerusalemDate, uniqueKey } from "@/lib/field/config";
 
 export const Route = createFileRoute("/deposits")({
   head: () => ({ meta: [
@@ -27,7 +27,7 @@ function Deposits() {
   const valid = !!doc && (any || method) && payOk;
 
   async function save() {
-    await enqueue("deposit", uniqueKey(`dep-${doc}`), { truck: f.truck!.id, docNumber: doc, items: counts, twoSites: two, payment: method ? { method, amount: Number(amount), receipt } : null, at: Date.now(), sheet: "היסטוריית_ביקורים" });
+    await enqueue("deposit", uniqueKey(`dep-${doc}`), { truck: f.truck!.id, driver: f.truck!.driver, docNumber: doc, items: counts, twoSites: two, payment: method ? { method, amount: Number(amount), receipt } : null, fileName: receipt ? `receipt_${doc}_${jerusalemDate()}.jpg` : undefined, folder: DRIVE_FOLDER, at: Date.now(), sheetId: SHEET_ID_MAIN, sheet: "אתרי_לקוחות", notify: { whatsapp: false, email: emailForTruck(f.truck!.id) } });
     const s = (await kvGet<{ items: number; cash: number }>("depSum")) ?? { items: 0, cash: 0 };
     await kvSet("depSum", { items: s.items + Object.values(counts).reduce((a, b) => a + b, 0), cash: s.cash + (method ? Number(amount) : 0) });
     setCounts({}); setTwo(false); setDoc(""); setMethod(null); setAmount(""); setReceipt(""); f.confirm();

@@ -4,7 +4,7 @@ import { useField } from "@/components/field/FieldContext";
 import { BigInput, PhotoButton, Shell } from "@/components/field/Shell";
 import { enqueue, kvGet, kvSet } from "@/lib/field/db";
 import { enhanceDocument } from "@/lib/field/imaging";
-import { jerusalemTime, uniqueKey } from "@/lib/field/config";
+import { DRIVE_FOLDER, SHEET_ID_MAIN, emailForTruck, jerusalemDate, jerusalemTime, uniqueKey } from "@/lib/field/config";
 
 export const Route = createFileRoute("/crane")({
   head: () => ({ meta: [
@@ -36,12 +36,12 @@ function Crane() {
   }
   async function stop() {
     const p = await gps(); const end = Date.now();
-    await enqueue("crane", `crane|${f.truck!.id}|${run!.start}`, { mode: "timer", truck: f.truck!.id, docNumber: doc || null, start: run!.start, end, seconds: Math.round((end - run!.start) / 1000), startGps: [run!.lat, run!.lng], endGps: p ? [p.coords.latitude, p.coords.longitude] : null });
+    await enqueue("crane", `crane|${f.truck!.id}|${run!.start}`, { mode: "timer", truck: f.truck!.id, driver: f.truck!.driver, docNumber: doc || null, start: run!.start, end, seconds: Math.round((end - run!.start) / 1000), startGps: [run!.lat, run!.lng], endGps: p ? [p.coords.latitude, p.coords.longitude] : null, sheetId: SHEET_ID_MAIN, sheet: "סשנים_PTO", notify: { whatsapp: false, email: emailForTruck(f.truck!.id) } });
     await kvSet("craneSec", ((await kvGet<number>("craneSec")) ?? 0) + Math.round((end - run!.start) / 1000));
     await kvSet("craneRun", null); setRun(null); setDoc(""); f.confirm();
   }
   async function sendOcr() {
-    await enqueue("crane", uniqueKey(`crane-ocr-${doc}`), { mode: "ocr", truck: f.truck!.id, docNumber: doc, photo, at: Date.now() });
+    await enqueue("crane", uniqueKey(`crane-ocr-${doc}`), { mode: "ocr", truck: f.truck!.id, driver: f.truck!.driver, docNumber: doc, photo, fileName: `crane_ocr_${doc}_${jerusalemDate()}.jpg`, folder: DRIVE_FOLDER, at: Date.now(), sheetId: SHEET_ID_MAIN, sheet: "סשנים_PTO", notify: { whatsapp: false, email: emailForTruck(f.truck!.id) } });
     setPhoto(""); setDoc(""); f.confirm();
   }
 

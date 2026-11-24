@@ -4,7 +4,7 @@ import { useField } from "@/components/field/FieldContext";
 import { BigInput, PhotoButton, Shell } from "@/components/field/Shell";
 import { enqueue, kvSet } from "@/lib/field/db";
 import { photoToDataUrl } from "@/lib/field/imaging";
-import { dailyKm, jerusalemDate } from "@/lib/field/config";
+import { DRIVE_FOLDER, SHEET_ID_MAIN, dailyKm, emailForTruck, jerusalemDate } from "@/lib/field/config";
 
 export const Route = createFileRoute("/tacho")({
   head: () => ({ meta: [
@@ -30,10 +30,18 @@ function Tacho() {
     if (!closing) {
       await Promise.all([kvSet("podCount", 0), kvSet("depSum", { items: 0, cash: 0 }), kvSet("craneSec", 0)]);
       f.setDay({ date, truck: f.truck!.id, openOdo: n, openPhoto: photo, openAt: now });
-      await enqueue("tacho", `tacho-open|${f.truck!.id}|${date}`, { type: "open", truck: f.truck!.id, odometer: n, photo, at: now, sheet: "ארכיון_טכוגרף" });
+      await enqueue("tacho", `tacho-open|${f.truck!.id}|${date}`, {
+        type: "open", truck: f.truck!.id, driver: f.truck!.driver, odometer: n, photo,
+        fileName: `tacho_open_${f.truck!.id}_${date}.jpg`, folder: DRIVE_FOLDER, at: now,
+        sheetId: SHEET_ID_MAIN, sheet: "ארכיון_טכוגרף", notify: { whatsapp: true, email: emailForTruck(f.truck!.id) },
+      });
     } else {
       f.setDay({ ...f.day!, closeOdo: n, closePhoto: photo, closeAt: now });
-      await enqueue("tacho", `tacho-close|${f.truck!.id}|${date}`, { type: "close", truck: f.truck!.id, odometer: n, km, photo, at: now, sheet: "ארכיון_טכוגרף" });
+      await enqueue("tacho", `tacho-close|${f.truck!.id}|${date}`, {
+        type: "close", truck: f.truck!.id, driver: f.truck!.driver, odometer: n, km, photo,
+        fileName: `tacho_close_${f.truck!.id}_${date}.jpg`, folder: DRIVE_FOLDER, at: now,
+        sheetId: SHEET_ID_MAIN, sheet: "ארכיון_טכוגרף", notify: { whatsapp: true, email: emailForTruck(f.truck!.id) },
+      });
     }
     f.confirm(); setTimeout(() => nav({ to: "/" }), 700);
   }
