@@ -1,0 +1,3 @@
+{ "name": "סבן שטח", "short_name": "סבן שטח", "start_url": "/", "scope": "/", "display": "fullscreen",
+  "orientation": "any", "background_color": "#14171c", "theme_color": "#14171c", "lang": "he", "dir": "rtl",
+  "icons": [{ "src": "/favicon.ico", "sizes": "64x64", "type": "image/x-icon" }] }

@@ -28,3 +28,6 @@ use the editor.
   own key and store it in Secrets.
 - **Secrets.** Lovable manages them. Do not put secret values in the repo.
 <!-- LOVABLE:END -->
+# AGENTS
+- Field app data is stored offline-first in IndexedDB (src/lib/field/db.ts) and pushed by a priority queue in sync.ts; never write directly to remote services from screens.
+- Business rules (trucks, weight limits, file names, Jerusalem time) live in src/lib/field/config.ts with tests beside it.

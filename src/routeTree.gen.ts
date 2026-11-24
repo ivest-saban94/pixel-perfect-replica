@@ -10,33 +10,83 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as CraneRouteImport } from './routes/crane'
+import { Route as DepositsRouteImport } from './routes/deposits'
+import { Route as PodRouteImport } from './routes/pod'
+import { Route as SummaryRouteImport } from './routes/summary'
+import { Route as TachoRouteImport } from './routes/tacho'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const CraneRoute = CraneRouteImport.update({
+  id: '/crane',
+  path: '/crane',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DepositsRoute = DepositsRouteImport.update({
+  id: '/deposits',
+  path: '/deposits',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PodRoute = PodRouteImport.update({
+  id: '/pod',
+  path: '/pod',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SummaryRoute = SummaryRouteImport.update({
+  id: '/summary',
+  path: '/summary',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TachoRoute = TachoRouteImport.update({
+  id: '/tacho',
+  path: '/tacho',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/crane': typeof CraneRoute
+  '/deposits': typeof DepositsRoute
+  '/pod': typeof PodRoute
+  '/summary': typeof SummaryRoute
+  '/tacho': typeof TachoRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/crane': typeof CraneRoute
+  '/deposits': typeof DepositsRoute
+  '/pod': typeof PodRoute
+  '/summary': typeof SummaryRoute
+  '/tacho': typeof TachoRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/crane': typeof CraneRoute
+  '/deposits': typeof DepositsRoute
+  '/pod': typeof PodRoute
+  '/summary': typeof SummaryRoute
+  '/tacho': typeof TachoRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/'
+  fullPaths: '/' | '/crane' | '/deposits' | '/pod' | '/summary' | '/tacho'
   fileRoutesByTo: FileRoutesByTo
-  to: '/'
-  id: '__root__' | '/'
+  to: '/' | '/crane' | '/deposits' | '/pod' | '/summary' | '/tacho'
+  id: '__root__' | '/' | '/crane' | '/deposits' | '/pod' | '/summary' | '/tacho'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  CraneRoute: typeof CraneRoute
+  DepositsRoute: typeof DepositsRoute
+  PodRoute: typeof PodRoute
+  SummaryRoute: typeof SummaryRoute
+  TachoRoute: typeof TachoRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -48,11 +98,51 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/crane': {
+      id: '/crane'
+      path: '/crane'
+      fullPath: '/crane'
+      preLoaderRoute: typeof CraneRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/deposits': {
+      id: '/deposits'
+      path: '/deposits'
+      fullPath: '/deposits'
+      preLoaderRoute: typeof DepositsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/pod': {
+      id: '/pod'
+      path: '/pod'
+      fullPath: '/pod'
+      preLoaderRoute: typeof PodRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/summary': {
+      id: '/summary'
+      path: '/summary'
+      fullPath: '/summary'
+      preLoaderRoute: typeof SummaryRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/tacho': {
+      id: '/tacho'
+      path: '/tacho'
+      fullPath: '/tacho'
+      preLoaderRoute: typeof TachoRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  CraneRoute: CraneRoute,
+  DepositsRoute: DepositsRoute,
+  PodRoute: PodRoute,
+  SummaryRoute: SummaryRoute,
+  TachoRoute: TachoRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
