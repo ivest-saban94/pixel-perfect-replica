@@ -1,44 +1,48 @@
-# שכבת תעודה חיה + אינטגרציית גיליון
+# שכבת תעודה חיה + אינטגרציית גיליון + OCR
 
-## מה נוסף
+## מה כלול
 
-1. **`/delivery-overlay`** – מסך קליטה + תצוגה מקדימה RTL + טופס נהג.
-2. **`/api/delivery-extract`** – חילוץ ראשוני מ-PDF/תמונה → JSON אחיד (ניתן להשלים ידנית).
-3. **`/api/delivery-overlay`** – שליחת שכבת הנהג לגיליון.
+1. **`/delivery-overlay`** – קליטה, תצוגה מקדימה RTL, טופס נהג.
+2. **`/api/delivery-extract`** – חילוץ טקסט + **Google Vision OCR** לתמונות סרוקות.
+3. **`/api/delivery-overlay`** – שליחה לגיליון (שרת Node **או** Apps Script).
+4. **Apps Script** – handler מלא `kind: "delivery_overlay"` + `kind: "delivery_ocr"`.
+5. **קישור מ-POD** – כפתור «שכבת נהג» במסך `/pod` + seed ל-sessionStorage אחרי יצירת PDF.
 
-## כתיבה לגיליון (`writeOverlayToSheet`)
+## Apps Script (`apps-script/Code.gs`)
 
-| יעד | תוכן |
-|-----|------|
-| **שכבת_נהג** (טאב חדש) | שורה מלאה: מנוף, המתנה, עבודת חכמת, פקדונות JSON, הערות |
-| **סשנים_PTO** | שיקוף סשן מנוף |
-| **אתרי_לקוחות** | שיקוף פקדונות |
-| **ארכיון_תעודות_גליה** | שורת ארכיון קלה (ללא PDF חובה) |
+### `delivery_overlay`
+כותב ל:
+- **שכבת_נהג** (כותרות מלאות, מפתח ייחודי, מניעת כפילויות)
+- **סשנים_PTO** – שיקוף מנוף
+- **אתרי_לקוחות** – שיקוף פקדונות
+- **ארכיון_תעודות_גליה** – שורת ארכיון
 
-מזהה ייחודי: `uniqueKey(docNumber|deliveryId)` כמו בשאר המערכת.
+### `delivery_ocr`
+Vision API עם `GOOGLE_VISION_API_KEY` ב-Script Properties (languageHints: he/en/ar).
 
-## משתני סביבה
+### התקנה
+1. העתיקו את `Code.gs` המעודכן לפרויקט Apps Script.
+2. הריצו `setupArchiveTabs` (יוצר גם **שכבת_נהג**).
+3. Script Properties:
+   - `SHEET_ID_MAIN`, `DRIVE_FOLDER_ID`, `MANAGER_OVERRIDE_CODE`
+   - `GOOGLE_VISION_API_KEY` (אופציונלי, ל-OCR)
+4. Deploy Web App מחדש.
 
-אותם כמו field sync:
+## OCR בשרת (Node)
 
-- `GOOGLE_SERVICE_ACCOUNT_JSON` **או** `APPS_SCRIPT_URL`
-- `SHEET_ID_MAIN` (ברירת מחדל: `1FsLseQrKbIj_AvlE6-dW4J12Gr88P3uaoFVBjEcUjsw`)
+`src/lib/delivery/visionOcr.ts` מנסה לפי סדר:
+1. `GOOGLE_VISION_API_KEY`
+2. `GOOGLE_SERVICE_ACCOUNT_JSON` (scope cloud-vision)
+3. `APPS_SCRIPT_URL` עם `kind: "delivery_ocr"`
 
-כשאין Service Account – ה-payload נשלח ל-Apps Script עם `kind: "delivery_overlay"` (יש להוסיף handler ב-`Code.gs`).
+לתמונות (`image/*`). PDF סרוק – מומלץ לרסטר עמוד בצד הלקוח ואז לשלוח JPEG.
 
-## עיצוב סטודיו
+## קישור מ-POD
 
-- רקע `#f4f6f9`, כרטיס לבן, גבול `#dfe4ec`, רדיוס 14px
-- כחול `#0f4c81`, ענבר `#f59e0b`
-- Heebo / Assistant, `dir=rtl`, `tabular-nums`
+במסך `/pod`:
+- אחרי «צור PDF» – נשמר `delivery:lastPodId` ב-sessionStorage
+- כפתור **שכבת נהג (מנוף / המתנה / פקדונות)** פותח `/delivery-overlay` עם מספר תעודה/לקוח/משאית ממולאים
+- לינק נוסף למסך המלא
 
-## זרימה
-
-1. העלאת PDF/תמונה → extract → sessionStorage
-2. טופס נהג (פתיחה/סגירה, המתנה, חכמת 9/15מ׳, פקדונות ±, הערות)
-3. POST `/api/delivery-overlay` → Sheets
-4. אישור + חזרה לבית
-
-## דמו
-
-במסך הקליטה: כפתור **"פתח דמו (חכמת + פקדונות)"**.
+## עיצוב
+`#f4f6f9` / `#0f4c81` / `#f59e0b`, Heebo, RTL, tabular-nums.
