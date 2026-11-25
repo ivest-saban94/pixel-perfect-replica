@@ -9,6 +9,9 @@ import {
   overWeight,
   type TruckId,
 } from "@/lib/field/config";
+import { getDriveAppsScriptUrl, uploadDriveFile, validateSafeWebhookUrl } from "./drive";
+
+export { validateSafeWebhookUrl };
 
 export interface SyncEnv {
   [key: string]: string | undefined;
@@ -116,29 +119,6 @@ export function resolveSheetTab(payload: SyncPayload): string {
     case "deposit":
       return "אתרי_לקוחות";
   }
-}
-
-export function validateSafeWebhookUrl(rawUrl: string): URL {
-  const parsed = new URL(rawUrl);
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new Error("URL must use http or https");
-  }
-  const host = parsed.hostname.toLowerCase();
-  if (
-    host === "localhost" ||
-    host === "127.0.0.1" ||
-    host === "::1" ||
-    host === "0.0.0.0" ||
-    host === "169.254.169.254" ||
-    host.startsWith("10.") ||
-    host.startsWith("192.168.") ||
-    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
-    host.endsWith(".internal") ||
-    host.endsWith(".local")
-  ) {
-    throw new Error("URL targets a restricted network address");
-  }
-  return parsed;
 }
 
 function bytesToBase64Url(bytes: Uint8Array): string {
@@ -637,12 +617,17 @@ export async function processSyncPayload(
     }
   }
 
+  const rawSa = readEnv("GOOGLE_SERVICE_ACCOUNT_JSON", runtimeEnv);
   const appsScriptUrl = readEnv("APPS_SCRIPT_URL", runtimeEnv);
-  if (appsScriptUrl) {
+  const driveAppsScriptUrl = getDriveAppsScriptUrl(runtimeEnv);
+
+  // Strategy A proxy: forward full payload to Apps Script when Service Account is not configured
+  if (!rawSa && appsScriptUrl) {
     const safeUrl = validateSafeWebhookUrl(appsScriptUrl);
     const res = await fetch(safeUrl.toString(), {
       method: "POST",
       headers: { "Content-Type": "text/plain" },
+      redirect: "follow",
       body: JSON.stringify(payload),
     });
     const text = await res.text();
@@ -681,7 +666,6 @@ export async function processSyncPayload(
     };
   }
 
-  const rawSa = readEnv("GOOGLE_SERVICE_ACCOUNT_JSON", runtimeEnv);
   if (!rawSa) {
     return {
       status: 503,
@@ -753,19 +737,39 @@ export async function processSyncPayload(
         const fileName =
           payload.fileName ||
           `${payload.kind}_${payload.truck}_${jerusalemDate()}.${isPdf ? "pdf" : "jpg"}`;
-        const folderId = await resolveOrCreateDriveFolder(
-          driveToken,
-          payload.folder || DRIVE_FOLDER,
-          readEnv("DRIVE_FOLDER_ID", runtimeEnv),
-        );
-        const uploaded = await uploadFileToDrive(
-          driveToken,
-          fileName,
-          fileData.mimeType,
-          fileData.bytes,
-          folderId,
-        );
-        driveUrl = uploaded.driveUrl;
+        const configuredFolderId = readEnv("DRIVE_FOLDER_ID", runtimeEnv);
+
+        if (driveAppsScriptUrl) {
+          // Strategy B (Hybrid): upload via Apps Script (script owner's quota), keep Sheets on SA
+          const uploaded = await uploadDriveFile(
+            {
+              fileName,
+              mimeType: fileData.mimeType,
+              base64: fileData.base64,
+              folder: payload.folder || DRIVE_FOLDER,
+              ...(configuredFolderId ? { folderId: configuredFolderId } : {}),
+            },
+            runtimeEnv,
+          );
+          if (!uploaded.ok || !uploaded.driveUrl) {
+            throw new Error(uploaded.error || "העלאת הקובץ ל-Drive דרך Apps Script נכשלה");
+          }
+          driveUrl = uploaded.driveUrl;
+        } else {
+          const folderId = await resolveOrCreateDriveFolder(
+            driveToken,
+            payload.folder || DRIVE_FOLDER,
+            configuredFolderId,
+          );
+          const uploaded = await uploadFileToDrive(
+            driveToken,
+            fileName,
+            fileData.mimeType,
+            fileData.bytes,
+            folderId,
+          );
+          driveUrl = uploaded.driveUrl;
+        }
         attachment = { fileName, base64: fileData.base64 };
       }
 
@@ -857,6 +861,7 @@ export interface SyncDiagnostics {
     accessOk: boolean;
     folderFound?: boolean;
     isSharedDrive?: boolean;
+    driveAppsScriptConfigured?: boolean;
     error?: string;
   };
   notifications: {
@@ -891,6 +896,7 @@ export async function getSyncDiagnostics(runtimeEnv?: SyncEnv): Promise<SyncDiag
       folderIdConfigured: Boolean(folderId),
       folderName: DRIVE_FOLDER,
       accessOk: false,
+      driveAppsScriptConfigured: Boolean(getDriveAppsScriptUrl(runtimeEnv)),
     },
     notifications: {
       emailProvider,
@@ -975,8 +981,8 @@ export async function getSyncDiagnostics(runtimeEnv?: SyncEnv): Promise<SyncDiag
           readEnv("GOOGLE_OAUTH_CLIENT_SECRET", runtimeEnv) &&
           readEnv("GOOGLE_OAUTH_REFRESH_TOKEN", runtimeEnv),
         );
-        const hasAppsScript = Boolean(readEnv("APPS_SCRIPT_URL", runtimeEnv));
-        if (fData.capabilities?.canAddChildren === false) {
+        const hasAppsScript = Boolean(getDriveAppsScriptUrl(runtimeEnv));
+        if (fData.capabilities?.canAddChildren === false && !hasAppsScript) {
           out.drive.error =
             "Service Account lacks write permission (canAddChildren=false) on DRIVE_FOLDER_ID";
         } else if (!fData.driveId && !hasOAuthDrive && !hasAppsScript) {

@@ -1,19 +1,33 @@
 /**
  * Google Apps Script Web App — סבן שטח (ח. סבן חומרי בניין 1994 בע"מ)
- * Deploy as Web App (Execute as: Me, Who has access: Anyone) and set URL in VITE_SYNC_ENDPOINT.
+ *
+ * Supports two operating modes:
+ *   Mode A (Full Sync): Set the deployed Web App URL as VITE_SYNC_ENDPOINT.
+ *     The client app posts directly here; handles Drive upload, Sheets dedup/append,
+ *     overweight manager override, and Hebrew email delivery via MailApp.
+ *   Mode B (Hybrid Drive Upload): Set the deployed Web App URL as APPS_SCRIPT_URL
+ *     or DRIVE_APPS_SCRIPT_URL on the server (/api/sync). The server handles
+ *     Sheets (Service Account) + Resend email, and calls this Web App with
+ *     kind: "drive_upload" so files are saved in the script owner's Google Drive quota.
  *
  * Optional Script Properties (Project Settings -> Script Properties):
- * - SHEET_ID_MAIN: defaults to 1FsLseQrKbIj_AvlE6-dW4J12Gr88P3uaoFVBjEcUjsw
- * - DRIVE_FOLDER_ID: target Google Drive folder ID (defaults to folder "בירור_תעודות_משלוח_ראמי")
- * - MANAGER_OVERRIDE_CODE: server-side validation code for overweight deliveries
- * - WHATSAPP_WEBHOOK_URL: webhook endpoint for WhatsApp group notifications
- * - WHATSAPP_WEBHOOK_TOKEN: optional Bearer token for WhatsApp webhook
- * - WHATSAPP_GROUP_ID: group identifier (e.g. "עדכונים מהסידור")
+ * - SHEET_ID_MAIN: defaults to "1FsLseQrKbIj_AvlE6-dW4J12Gr88P3uaoFVBjEcUjsw"
+ * - DRIVE_FOLDER_ID: defaults to "1KvvtgwKBVrUlMEApK3Jy-ejfnUG3f_fT" (בירור-תעודות)
+ * - MANAGER_OVERRIDE_CODE: server-side validation code for overweight POD deliveries
  */
 
 const DEFAULT_SHEET_ID = "1FsLseQrKbIj_AvlE6-dW4J12Gr88P3uaoFVBjEcUjsw";
-const DEFAULT_DRIVE_FOLDER = "בירור_תעודות_משלוח_ראמי";
+const DEFAULT_DRIVE_FOLDER_ID = "1KvvtgwKBVrUlMEApK3Jy-ejfnUG3f_fT";
+const DEFAULT_DRIVE_FOLDER_NAME = "בירור-תעודות";
 const TZ = "Asia/Jerusalem";
+
+const VALID_KINDS = {
+  pod: true,
+  tacho: true,
+  crane: true,
+  deposit: true,
+  gps: true,
+};
 
 const TRUCK_MAX_TONS = {
   "615-41-002": 10.2,
@@ -42,29 +56,60 @@ function doPost(e) {
   const lock = LockService.getScriptLock();
   try {
     if (!e || !e.postData || !e.postData.contents) {
-      return jsonResponse({ ok: false, error: "Empty request body" });
+      return jsonResponse({ ok: false, error: "גוף הבקשה ריק" });
     }
-    const payload = JSON.parse(e.postData.contents);
-    if (!payload.kind || !payload.key || !payload.truck) {
-      return jsonResponse({ ok: false, error: "Missing required fields (kind, key, truck)" });
+
+    let payload;
+    try {
+      payload = JSON.parse(e.postData.contents);
+    } catch (_parseErr) {
+      return jsonResponse({ ok: false, error: "פורמט JSON לא תקין" });
     }
+
+    if (!payload || !payload.kind) {
+      return jsonResponse({ ok: false, error: "חסר שדה חובה: kind" });
+    }
+
+    lock.waitLock(30000);
 
     const props = PropertiesService.getScriptProperties();
 
-    // Server-side manager override validation for overweight deliveries
+    // Strategy B (Hybrid): Drive upload only from /api/sync (src/lib/server/drive.ts)
+    if (payload.kind === "drive_upload") {
+      return handleDriveUploadOnly_(payload, props);
+    }
+
+    if (!VALID_KINDS[payload.kind]) {
+      return jsonResponse({ ok: false, error: "סוג פעולה לא חוקי: " + payload.kind });
+    }
+
+    if (!payload.key || !payload.truck) {
+      return jsonResponse({ ok: false, error: "חסרים שדות חובה (kind, key, truck)" });
+    }
+
+    const emailTo = TRUCK_EMAILS[payload.truck] || "galya@saban94.co.il";
+    const tabName = resolveTabName_(payload);
+
+    // Server-side manager override validation for overweight POD deliveries
     const maxTons = TRUCK_MAX_TONS[payload.truck];
     if (payload.kind === "pod" && maxTons && payload.tons != null && Number(payload.tons) > maxTons) {
       const expectedCode = props.getProperty("MANAGER_OVERRIDE_CODE");
-      if (expectedCode && payload.overrideCode !== expectedCode) {
-        return jsonResponse({ ok: false, error: "קוד מנהל שגוי לחריגת משקל" });
+      if (expectedCode && String(payload.overrideCode || "") !== String(expectedCode)) {
+        return jsonResponse({
+          ok: false,
+          driveUrl: null,
+          duplicate: false,
+          sheet: tabName,
+          emailTo: emailTo,
+          emailSent: false,
+          whatsappSent: false,
+          error: "קוד מנהל שגוי לחריגת משקל",
+        });
       }
     }
 
-    lock.waitLock(20000);
-
     const sheetId = props.getProperty("SHEET_ID_MAIN") || DEFAULT_SHEET_ID;
     const ss = SpreadsheetApp.openById(sheetId);
-    const tabName = resolveTabName_(payload);
     let sheet = ss.getSheetByName(tabName);
     if (!sheet) {
       sheet = ss.insertSheet(tabName);
@@ -73,7 +118,8 @@ function doPost(e) {
     // Idempotent deduplication by key in column A
     const lastRow = sheet.getLastRow();
     if (lastRow > 0) {
-      const values = sheet.getRange(1, 1, lastRow, Math.min(12, Math.max(1, sheet.getLastColumn()))).getValues();
+      const numCols = Math.min(13, Math.max(1, sheet.getLastColumn()));
+      const values = sheet.getRange(1, 1, lastRow, numCols).getValues();
       for (let i = 0; i < values.length; i++) {
         if (String(values[i][0]) === String(payload.key)) {
           let existingDriveUrl = null;
@@ -86,9 +132,10 @@ function doPost(e) {
           }
           return jsonResponse({
             ok: true,
-            duplicate: true,
             driveUrl: existingDriveUrl,
+            duplicate: true,
             sheet: tabName,
+            emailTo: emailTo,
             emailSent: false,
             whatsappSent: false,
           });
@@ -96,76 +143,120 @@ function doPost(e) {
       }
     }
 
+    // Upload media (PDF / Tacho photo / Deposit receipt) to Drive using script owner's quota
     let driveUrl = null;
     let attachmentBlob = null;
     const mediaSource = payload.pdf || payload.photo || (payload.payment && payload.payment.receipt);
     if (mediaSource) {
-      const parsed = parseDataUri_(mediaSource, payload.pdf ? "application/pdf" : "image/jpeg");
-      const ext = payload.pdf ? "pdf" : "jpg";
-      const fileName = payload.fileName || payload.kind + "_" + payload.truck + "_" + formatDate_(new Date()) + "." + ext;
-      const folder = resolveDriveFolder_(props.getProperty("DRIVE_FOLDER_ID"), payload.folder || DEFAULT_DRIVE_FOLDER);
-      attachmentBlob = Utilities.newBlob(Utilities.base64Decode(parsed.base64), parsed.mimeType, fileName);
-      const file = folder.createFile(attachmentBlob);
-      driveUrl = file.getUrl();
+      const isPdf = Boolean(payload.pdf);
+      const fallbackMime = isPdf ? "application/pdf" : "image/jpeg";
+      const ext = isPdf ? "pdf" : "jpg";
+      const fileName =
+        payload.fileName || payload.kind + "_" + payload.truck + "_" + formatDate_(new Date()) + "." + ext;
+      const saved = saveMediaToDrive_(
+        mediaSource,
+        fileName,
+        fallbackMime,
+        props.getProperty("DRIVE_FOLDER_ID") || DEFAULT_DRIVE_FOLDER_ID,
+        payload.folder || DEFAULT_DRIVE_FOLDER_NAME,
+      );
+      driveUrl = saved.driveUrl;
+      attachmentBlob = saved.blob;
     }
 
-    const emailTo = TRUCK_EMAILS[payload.truck] || "galya@saban94.co.il";
     const driver = payload.driver || TRUCK_DRIVERS[payload.truck] || payload.truck;
     const row = buildRow_(payload, driver, driveUrl, emailTo);
     sheet.appendRow(row);
 
-    const copy = buildNotification_(payload, driver, driveUrl);
+    // Optional email notification (pod / tacho only) via script owner's MailApp
     let emailSent = false;
-    if (payload.kind === "pod" || payload.kind === "tacho" || (payload.notify && payload.notify.email)) {
-      const options = attachmentBlob ? { attachments: [attachmentBlob] } : {};
-      GmailApp.sendEmail(emailTo, copy.subject, copy.text, options);
-      emailSent = true;
-    }
-
-    let whatsappSent = false;
-    const waWebhook = props.getProperty("WHATSAPP_WEBHOOK_URL");
-    if (waWebhook && payload.notify && payload.notify.whatsapp && (payload.kind === "pod" || payload.kind === "tacho")) {
-      const waToken = props.getProperty("WHATSAPP_WEBHOOK_TOKEN");
-      const waGroup = props.getProperty("WHATSAPP_GROUP_ID") || "עדכונים מהסידור";
-      const headers = { "Content-Type": "application/json" };
-      if (waToken) headers["Authorization"] = "Bearer " + waToken;
-      const res = UrlFetchApp.fetch(waWebhook, {
-        method: "post",
-        contentType: "application/json",
-        headers: headers,
-        payload: JSON.stringify({
-          groupId: waGroup,
-          chatName: "עדכונים מהסידור",
-          message: copy.text,
-          docNumber: payload.docNumber || null,
-          driver: driver,
-          truck: payload.truck,
-          driveUrl: driveUrl,
-        }),
-        muteHttpExceptions: true,
-      });
-      if (res.getResponseCode() < 200 || res.getResponseCode() >= 300) {
-        throw new Error("WhatsApp webhook HTTP " + res.getResponseCode() + ": " + res.getContentText());
+    let emailError = null;
+    if (payload.kind === "pod" || payload.kind === "tacho") {
+      try {
+        const copy = buildNotification_(payload, driver, driveUrl);
+        const options = {};
+        if (payload.kind === "pod" && attachmentBlob) {
+          options.attachments = [attachmentBlob];
+        } else if (payload.kind === "tacho" && !driveUrl && attachmentBlob) {
+          options.attachments = [attachmentBlob];
+        }
+        MailApp.sendEmail(emailTo, copy.subject, copy.text, options);
+        emailSent = true;
+      } catch (mailErr) {
+        emailError = mailErr && mailErr.message ? mailErr.message : String(mailErr);
       }
-      whatsappSent = true;
     }
 
-    return jsonResponse({
+    const result = {
       ok: true,
-      duplicate: false,
       driveUrl: driveUrl,
+      duplicate: false,
       sheet: tabName,
       emailTo: emailTo,
       emailSent: emailSent,
-      whatsappSent: whatsappSent,
-    });
+      whatsappSent: false,
+    };
+    if (emailError) {
+      result.emailError = emailError;
+    }
+    return jsonResponse(result);
   } catch (err) {
-    return jsonResponse({ ok: false, error: err && err.message ? err.message : String(err) });
+    return jsonResponse({
+      ok: false,
+      driveUrl: null,
+      duplicate: false,
+      sheet: "",
+      emailTo: "",
+      emailSent: false,
+      whatsappSent: false,
+      error: err && err.message ? err.message : String(err),
+    });
   } finally {
     try {
       lock.releaseLock();
-    } catch (_) {}
+    } catch (_releaseErr) {}
   }
+}
+
+function handleDriveUploadOnly_(payload, props) {
+  const source = payload.base64 || payload.dataUri;
+  if (!source) {
+    return jsonResponse({ ok: false, driveUrl: null, error: "חסר תוכן קובץ (base64)" });
+  }
+  const fallbackMime = payload.mimeType || "application/octet-stream";
+  const ext = fallbackMime.indexOf("pdf") !== -1 ? "pdf" : "jpg";
+  const fileName = payload.fileName || "saban_upload_" + formatDate_(new Date()) + "." + ext;
+  const folderId = payload.folderId || props.getProperty("DRIVE_FOLDER_ID") || DEFAULT_DRIVE_FOLDER_ID;
+  const folderName = payload.folder || DEFAULT_DRIVE_FOLDER_NAME;
+
+  const saved = saveMediaToDrive_(source, fileName, fallbackMime, folderId, folderName);
+  return jsonResponse({
+    ok: true,
+    driveUrl: saved.driveUrl,
+    fileId: saved.fileId,
+    fileName: saved.fileName,
+  });
+}
+
+function saveMediaToDrive_(mediaSource, fileName, fallbackMime, folderId, folderName) {
+  const parsed = parseDataUri_(mediaSource, fallbackMime);
+  const blob = Utilities.newBlob(Utilities.base64Decode(parsed.base64), parsed.mimeType, fileName);
+  const folder = resolveDriveFolder_(folderId, folderName);
+  const file = folder.createFile(blob);
+
+  // Best-effort link sharing so dispatchers/managers can open driveUrl directly
+  try {
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  } catch (_sharingErr) {
+    // Domain policies may restrict external sharing; keep file.getUrl() intact
+  }
+
+  return {
+    fileId: file.getId(),
+    fileName: file.getName(),
+    driveUrl: file.getUrl(),
+    blob: blob,
+  };
 }
 
 function resolveTabName_(payload) {
@@ -184,15 +275,25 @@ function resolveTabName_(payload) {
 }
 
 function resolveDriveFolder_(folderId, folderName) {
-  if (folderId) return DriveApp.getFolderById(folderId);
-  const it = DriveApp.getFoldersByName(folderName);
-  return it.hasNext() ? it.next() : DriveApp.createFolder(folderName);
+  if (folderId) {
+    try {
+      return DriveApp.getFolderById(folderId);
+    } catch (_idErr) {
+      // Fall back to name lookup below if folder ID is inaccessible
+    }
+  }
+  const targetName = folderName || DEFAULT_DRIVE_FOLDER_NAME;
+  const it = DriveApp.getFoldersByName(targetName);
+  return it.hasNext() ? it.next() : DriveApp.createFolder(targetName);
 }
 
 function parseDataUri_(input, fallbackMime) {
-  const m = /^data:([^;,]+)(?:;[^,]*)?;base64,([\s\S]+)$/.exec(String(input).trim());
-  if (m) return { mimeType: m[1], base64: m[2].replace(/\s+/g, "") };
-  return { mimeType: fallbackMime, base64: String(input).replace(/\s+/g, "") };
+  const raw = String(input).trim();
+  const m = /^data:([^;,]+)(?:;[^,]*)?;base64,([\s\S]+)$/.exec(raw);
+  if (m) {
+    return { mimeType: m[1], base64: m[2].replace(/\s+/g, "") };
+  }
+  return { mimeType: fallbackMime, base64: raw.replace(/\s+/g, "") };
 }
 
 function formatDate_(d) {
@@ -210,22 +311,44 @@ function buildRow_(payload, driver, driveUrl, emailTo) {
 
   if (payload.kind === "pod") {
     return [
-      payload.key, dateStr, timeStr, payload.truck, driver,
-      payload.docNumber || "", payload.customer || "", payload.tons != null ? payload.tons : "",
-      payload.overrideCode || "", payload.fileName || "", driveUrl || "", emailTo,
+      payload.key,
+      dateStr,
+      timeStr,
+      payload.truck,
+      driver,
+      payload.docNumber || "",
+      payload.customer || "",
+      payload.tons != null ? payload.tons : "",
+      payload.overrideCode || "",
+      payload.fileName || "",
+      driveUrl || "",
+      emailTo,
     ];
   }
   if (payload.kind === "tacho") {
     return [
-      payload.key, dateStr, timeStr, payload.truck, driver,
-      payload.type || "", payload.odometer != null ? payload.odometer : "",
-      payload.km != null ? payload.km : "", driveUrl || "", emailTo,
+      payload.key,
+      dateStr,
+      timeStr,
+      payload.truck,
+      driver,
+      payload.type || "",
+      payload.odometer != null ? payload.odometer : "",
+      payload.km != null ? payload.km : "",
+      driveUrl || "",
+      emailTo,
     ];
   }
   if (payload.kind === "crane") {
     return [
-      payload.key, dateStr, timeStr, payload.truck, driver,
-      payload.mode || "timer", payload.docNumber || "", payload.seconds != null ? payload.seconds : "",
+      payload.key,
+      dateStr,
+      timeStr,
+      payload.truck,
+      driver,
+      payload.mode || "timer",
+      payload.docNumber || "",
+      payload.seconds != null ? payload.seconds : "",
       payload.start ? formatTime_(new Date(payload.start)) : "",
       payload.end ? formatTime_(new Date(payload.end)) : "",
       Array.isArray(payload.startGps) ? payload.startGps.join(",") : "",
@@ -235,15 +358,29 @@ function buildRow_(payload, driver, driveUrl, emailTo) {
   }
   if (payload.kind === "deposit") {
     return [
-      payload.key, dateStr, timeStr, payload.truck, driver,
-      payload.docNumber || "", JSON.stringify(payload.items || {}), Boolean(payload.twoSites),
-      payload.payment ? payload.payment.method : "", payload.payment ? payload.payment.amount : "",
+      payload.key,
+      dateStr,
+      timeStr,
+      payload.truck,
+      driver,
+      payload.docNumber || "",
+      JSON.stringify(payload.items || {}),
+      Boolean(payload.twoSites),
+      payload.payment ? payload.payment.method : "",
+      payload.payment ? payload.payment.amount : "",
       driveUrl || "",
     ];
   }
+  // gps
   return [
-    payload.key, dateStr, timeStr, payload.truck, driver,
-    payload.lat != null ? payload.lat : "", payload.lng != null ? payload.lng : "", payload.customer || "",
+    payload.key,
+    dateStr,
+    timeStr,
+    payload.truck,
+    driver,
+    payload.lat != null ? payload.lat : "",
+    payload.lng != null ? payload.lng : "",
+    payload.customer || "",
   ];
 }
 
@@ -254,17 +391,53 @@ function buildNotification_(payload, driver, driveUrl) {
     const lines = [
       "⏱ טכוגרף " + phase,
       "🚚 משאית: " + payload.truck + " (" + driver + ")",
-      "🔢 מד אוץ: " + (payload.odometer != null ? payload.odometer : "—") + (payload.km != null ? " | ק״מ היום: " + payload.km : ""),
+      "🔢 מד אוץ: " + (payload.odometer != null ? payload.odometer : "—"),
     ];
-    if (driveUrl) lines.push("🔗 קישור לדרייב: " + driveUrl);
+    if (payload.type === "close" && payload.km != null) {
+      lines.push("📏 ק״מ היום: " + payload.km);
+    }
+    if (driveUrl) {
+      lines.push("🔗 צפייה בצילום הדיסקית: " + driveUrl);
+    }
+    lines.push("", "בברכה,", "מערכת סבן שטח");
     return { subject: subject, text: lines.join("\n") };
   }
-  const subject = ("תעודת משלוח " + (payload.docNumber || "") + " · " + (payload.customer || "") + " · " + driver).trim();
+
+  const doc = payload.docNumber || "—";
+  const customer = payload.customer || "—";
+  const subject = "תעודת משלוח " + doc + " · " + customer + " · " + driver;
   const lines = [
-    "📄 תעודת משלוח: " + (payload.docNumber || "—") + (payload.customer ? " | לקוח: " + payload.customer : ""),
+    "שלום,",
+    "מצורפת תעודת משלוח לעיונך.",
+    "",
+    "📄 מספר תעודה: " + doc,
+    "👤 לקוח: " + customer,
     "🚚 משאית: " + payload.truck + " (" + driver + ")",
   ];
-  if (payload.tons != null) lines.push("⚖️ משקל: " + payload.tons + " טון");
-  if (driveUrl) lines.push("🔗 קישור לדרייב: " + driveUrl);
+  if (payload.tons != null) {
+    lines.push("⚖️ משקל: " + payload.tons + " טון");
+  }
+  if (driveUrl) {
+    lines.push("🔗 קישור לדרייב: " + driveUrl);
+  }
+  lines.push("", "בברכה,", "מערכת סבן שטח");
   return { subject: subject, text: lines.join("\n") };
 }
+
+/**
+ * ============================================================
+ * הוראות התקנה ו-Deploy (Google Apps Script Web App):
+ * ============================================================
+ * 1. פתחו https://script.google.com תחת החשבון שמחזיק בתיקיית ה-Drive ובגיליון.
+ * 2. צרו פרויקט חדש והדביקו את כל תוכן הקובץ לתוך Code.gs (ושמרו).
+ * 3. אופציונלי — Project Settings → Script Properties:
+ *    - SHEET_ID_MAIN = 1FsLseQrKbIj_AvlE6-dW4J12Gr88P3uaoFVBjEcUjsw
+ *    - DRIVE_FOLDER_ID = 1KvvtgwKBVrUlMEApK3Jy-ejfnUG3f_fT
+ *    - MANAGER_OVERRIDE_CODE = <קוד המנהל לחריגת משקל>
+ * 4. לחצו: Deploy → New deployment → Select type: Web app
+ *    - Execute as: Me (המשתמש האנושי, כדי שהקבצים יישמרו ב-Drive שלכם)
+ *    - Who has access: Anyone
+ * 5. העתיקו את ה-Web app URL שנוצר:
+ *    - למצב מלא (ללא צורך בשרת): הדביקו במשתנה VITE_SYNC_ENDPOINT
+ *    - למצב היברידי (Sheets + Resend בשרת, Drive דרך Apps Script): הדביקו ב-APPS_SCRIPT_URL (או DRIVE_APPS_SCRIPT_URL)
+ */

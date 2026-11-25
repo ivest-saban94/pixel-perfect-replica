@@ -206,4 +206,60 @@ describe("syncHandler", () => {
     expect(diag.notifications.emailProvider).toBe("none");
     expect(diag.sheets.sheetId).toBe("1FsLseQrKbIj_AvlE6-dW4J12Gr88P3uaoFVBjEcUjsw");
   });
+
+  it("resolves Drive Apps Script URL cleanly and ignores relative /api/sync", async () => {
+    const { getDriveAppsScriptUrl, uploadViaAppsScript } = await import("./drive");
+    expect(getDriveAppsScriptUrl({ VITE_SYNC_ENDPOINT: "/api/sync" })).toBeUndefined();
+    expect(
+      getDriveAppsScriptUrl({
+        VITE_SYNC_ENDPOINT: "/api/sync",
+        APPS_SCRIPT_URL: "https://script.google.com/macros/s/abc/exec",
+      }),
+    ).toBe("https://script.google.com/macros/s/abc/exec");
+    expect(
+      getDriveAppsScriptUrl({
+        APPS_SCRIPT_URL: "https://script.google.com/macros/s/old/exec",
+        DRIVE_APPS_SCRIPT_URL: "https://script.google.com/macros/s/drive/exec",
+      }),
+    ).toBe("https://script.google.com/macros/s/drive/exec");
+
+    const missing = await uploadViaAppsScript(
+      { fileName: "test.pdf", mimeType: "application/pdf", base64: "JVBERi0=" },
+      {},
+    );
+    expect(missing.ok).toBe(false);
+    expect(missing.driveUrl).toBeNull();
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ok: true,
+          driveUrl: "https://drive.google.com/file/d/drive123/view",
+          fileId: "drive123",
+        }),
+        { status: 200 },
+      ),
+    );
+    const uploaded = await uploadViaAppsScript(
+      {
+        fileName: "123_test_20261125.pdf",
+        mimeType: "application/pdf",
+        base64: "JVBERi0=",
+        folderId: "1KvvtgwKBVrUlMEApK3Jy-ejfnUG3f_fT",
+      },
+      { APPS_SCRIPT_URL: "https://script.google.com/macros/s/drive/exec" },
+    );
+    expect(uploaded).toEqual({
+      ok: true,
+      driveUrl: "https://drive.google.com/file/d/drive123/view",
+      fileId: "drive123",
+    });
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "https://script.google.com/macros/s/drive/exec",
+      expect.objectContaining({
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+      }),
+    );
+  });
 });
