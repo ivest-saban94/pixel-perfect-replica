@@ -23,18 +23,27 @@ export function computeBackoffMs(attempts: number): number {
   return BACKOFF_MS[idx] ?? 300_000;
 }
 
+/** HTTP status codes that represent permanent rejection (e.g. 403 wrong manager code) rather than transient network failure. */
+export function isPermanentRejectionStatus(status: number): boolean {
+  return status === 400 || status === 401 || status === 403 || status === 404 || status === 422;
+}
+
 /**
  * Drains the offline queue in priority order (POD → tacho → crane/deposits → GPS).
- * Retries failed network or server responses with exponential backoff, and retries immediately on reconnect.
+ * Permanent rejections (like 403 invalid manager override code) mark the item as "error"
+ * and continue draining remaining items instead of blocking the entire queue.
  */
 let running = false;
-export async function drainQueue(force = false): Promise<{ sent: number; left: number }> {
+export async function drainQueue(
+  force = false,
+): Promise<{ sent: number; left: number; errors: number }> {
   if (running || typeof navigator === "undefined" || !navigator.onLine) {
-    return { sent: 0, left: (await pendingSorted()).length };
+    return { sent: 0, left: (await pendingSorted()).length, errors: 0 };
   }
   const endpoint = getSyncEndpoint();
   running = true;
   let sent = 0;
+  let errors = 0;
   try {
     const items = await pendingReady(Date.now(), force);
     for (const it of items) {
@@ -57,7 +66,19 @@ export async function drainQueue(force = false): Promise<{ sent: number; left: n
           }
         }
         if (!r.ok || data?.ok === false) {
-          throw new Error(data?.error || `HTTP ${r.status}`);
+          const errMsg = data?.error || `HTTP ${r.status}`;
+          if (isPermanentRejectionStatus(r.status)) {
+            console.error("[sync] permanent rejection:", it.kind, it.key, r.status, errMsg);
+            it.status = "error";
+            it.attempts++;
+            it.lastAttemptAt = Date.now();
+            it.error = errMsg;
+            delete it.nextRetryAt;
+            await updateItem(it);
+            errors++;
+            continue;
+          }
+          throw new Error(errMsg);
         }
         it.status = "done";
         it.syncedAt = Date.now();
@@ -74,12 +95,12 @@ export async function drainQueue(force = false): Promise<{ sent: number; left: n
         it.nextRetryAt = it.lastAttemptAt + computeBackoffMs(it.attempts);
         it.error = message;
         await updateItem(it);
-        break; // preserve priority order, retry on next tick or online event
+        break; // preserve priority order on transient/network errors
       } finally {
         clearTimeout(timer);
       }
     }
-    return { sent, left: (await pendingSorted()).length };
+    return { sent, left: (await pendingSorted()).length, errors };
   } finally {
     running = false;
   }

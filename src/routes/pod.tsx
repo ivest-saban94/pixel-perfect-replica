@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { useField } from "@/components/field/FieldContext";
 import { BigInput, PhotoButton, Shell } from "@/components/field/Shell";
 import { enqueue, kvGet, kvSet } from "@/lib/field/db";
-import { enhanceDocument, pagesToPdf } from "@/lib/field/imaging";
+import { pagesToPdf } from "@/lib/field/imaging";
 import { matchLoadToPod, type LoadConfirmationSummary, type OrderRef } from "@/lib/field/loadMatch";
 import {
   DRIVE_FOLDER,
@@ -106,13 +106,9 @@ function Pod() {
       <div className="mx-auto grid max-w-xl gap-5">
         <PhotoButton
           label={`${f.t("addPage")} (${pages.length} ${f.t("pages")})`}
+          mode="document"
           multiple
-          onFiles={async (fs) => {
-            setBusy(true);
-            const out = await Promise.all(fs.map((x) => enhanceDocument(x)));
-            setPages((p) => [...p, ...out]);
-            setBusy(false);
-          }}
+          onCaptured={(urls) => setPages((p) => [...p, ...urls])}
         />
         {pages.length > 0 && (
           <div className="grid grid-cols-3 gap-2">

@@ -1,6 +1,15 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
-import { kvGet, kvSet, pendingSorted, type DayState } from "@/lib/field/db";
-import { startSyncLoop } from "@/lib/field/sync";
+import {
+  deleteQueueItem,
+  errorItemsSorted,
+  kvGet,
+  kvSet,
+  pendingSorted,
+  resetQueueItemToPending,
+  type DayState,
+  type QueueItem,
+} from "@/lib/field/db";
+import { drainQueue, startSyncLoop } from "@/lib/field/sync";
 import { jerusalemDate, TRUCKS, type Truck, type TruckId } from "@/lib/field/config";
 import { tr, type Key, type Lang } from "@/lib/field/i18n";
 import {
@@ -16,6 +25,14 @@ export interface OrderAlertBanner {
   orderId?: string;
 }
 
+function dayKeyForTruck(truckId: TruckId): string {
+  return `day:${truckId}`;
+}
+
+function shiftCycleKey(truckId: TruckId, date: string): string {
+  return `shiftCycle:${truckId}:${date}`;
+}
+
 interface Ctx {
   ready: boolean;
   lang: Lang;
@@ -24,9 +41,16 @@ interface Ctx {
   toggleSun: () => void;
   truck: Truck | null;
   setTruck: (id: TruckId | null) => void;
+  truckPickerOpen: boolean;
+  setTruckPickerOpen: (open: boolean) => void;
   day: DayState | null;
   setDay: (d: DayState | null) => void;
+  resetDay: () => Promise<void>;
+  shiftCycle: number;
   pending: number;
+  errorItems: QueueItem[];
+  retryErrorItem: (id: number) => Promise<void>;
+  removeErrorItem: (id: number) => Promise<void>;
   refreshPending: () => void;
   online: boolean;
   t: (k: Key) => string;
@@ -48,8 +72,11 @@ export function FieldProvider({ children }: { children: ReactNode }) {
   const [lang, setLangS] = useState<Lang>("he");
   const [sun, setSun] = useState(false);
   const [truckId, setTruckId] = useState<TruckId | null>(null);
+  const [truckPickerOpen, setTruckPickerOpen] = useState(false);
   const [day, setDayS] = useState<DayState | null>(null);
+  const [shiftCycle, setShiftCycle] = useState(0);
   const [pending, setPending] = useState(0);
+  const [errorItems, setErrorItems] = useState<QueueItem[]>([]);
   const [online, setOnline] = useState(true);
   const [flash, setFlash] = useState(false);
   const [ordersVersion, setOrdersVersion] = useState(0);
@@ -57,6 +84,30 @@ export function FieldProvider({ children }: { children: ReactNode }) {
 
   const refreshPending = useCallback(() => {
     void pendingSorted().then((p) => setPending(p.length));
+    void errorItemsSorted().then(setErrorItems);
+  }, []);
+
+  const loadTruckShift = useCallback(async (id: TruckId | null) => {
+    if (!id) {
+      setDayS(null);
+      setShiftCycle(0);
+      return;
+    }
+    const today = jerusalemDate();
+    const scoped = await kvGet<DayState>(dayKeyForTruck(id));
+    if (scoped && scoped.date === today) {
+      setDayS(scoped);
+    } else {
+      const legacy = await kvGet<DayState>("day");
+      if (legacy && legacy.date === today && legacy.truck === id) {
+        setDayS(legacy);
+        await kvSet(dayKeyForTruck(id), legacy);
+      } else {
+        setDayS(null);
+      }
+    }
+    const cycle = (await kvGet<number>(shiftCycleKey(id, today))) ?? 0;
+    setShiftCycle(cycle);
   }, []);
 
   useEffect(() => {
@@ -66,8 +117,7 @@ export function FieldProvider({ children }: { children: ReactNode }) {
       const savedTruck = (await kvGet<TruckId>("truck")) ?? null;
       setTruckId(savedTruck);
       if (savedTruck) setTruckUser(savedTruck);
-      const d = await kvGet<DayState>("day");
-      setDayS(d && d.date === jerusalemDate() ? d : null);
+      await loadTruckShift(savedTruck);
       setReady(true);
       refreshPending();
     })();
@@ -95,7 +145,7 @@ export function FieldProvider({ children }: { children: ReactNode }) {
       window.removeEventListener("online", on);
       window.removeEventListener("offline", off);
     };
-  }, [refreshPending]);
+  }, [loadTruckShift, refreshPending]);
 
   useEffect(() => {
     document.documentElement.lang = lang;
@@ -120,16 +170,71 @@ export function FieldProvider({ children }: { children: ReactNode }) {
     refreshPending();
   }, [refreshPending]);
 
+  const setTruck = useCallback(
+    (id: TruckId | null) => {
+      setTruckId(id);
+      setTruckPickerOpen(false);
+      void kvSet("truck", id);
+      if (id) setTruckUser(id);
+      void loadTruckShift(id);
+    },
+    [loadTruckShift],
+  );
+
+  const setDay = useCallback(
+    (d: DayState | null) => {
+      setDayS(d);
+      if (truckId) {
+        void kvSet(dayKeyForTruck(truckId), d);
+      }
+      void kvSet("day", d);
+    },
+    [truckId],
+  );
+
+  const resetDay = useCallback(async () => {
+    if (!truckId) return;
+    const today = jerusalemDate();
+    const nextCycle = ((await kvGet<number>(shiftCycleKey(truckId, today))) ?? 0) + 1;
+    await kvSet(shiftCycleKey(truckId, today), nextCycle);
+    setShiftCycle(nextCycle);
+    setDayS(null);
+    await kvSet(dayKeyForTruck(truckId), null);
+    await kvSet("day", null);
+  }, [truckId]);
+
+  const retryErrorItem = useCallback(
+    async (id: number) => {
+      await resetQueueItemToPending(id);
+      await drainQueue(true);
+      refreshPending();
+    },
+    [refreshPending],
+  );
+
+  const removeErrorItem = useCallback(
+    async (id: number) => {
+      await deleteQueueItem(id);
+      refreshPending();
+    },
+    [refreshPending],
+  );
+
   const value: Ctx = {
     ready,
     lang,
     sun,
     online,
     pending,
+    errorItems,
+    retryErrorItem,
+    removeErrorItem,
     refreshPending,
     flash,
     confirm,
     day,
+    resetDay,
+    shiftCycle,
     ordersVersion,
     orderAlert,
     dismissOrderAlert: () => setOrderAlert(null),
@@ -144,15 +249,10 @@ export function FieldProvider({ children }: { children: ReactNode }) {
       });
     },
     truck: TRUCKS.find((x) => x.id === truckId) ?? null,
-    setTruck: (id) => {
-      setTruckId(id);
-      void kvSet("truck", id);
-      if (id) setTruckUser(id);
-    },
-    setDay: (d) => {
-      setDayS(d);
-      void kvSet("day", d);
-    },
+    setTruck,
+    truckPickerOpen,
+    setTruckPickerOpen,
+    setDay,
     t: (k) => tr(k, lang),
   };
   return <C.Provider value={value}>{children}</C.Provider>;

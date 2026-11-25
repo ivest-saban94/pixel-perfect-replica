@@ -27,6 +27,8 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-brand: #1a56db;
+  --color-brand-foreground: #ffffff;
 }
 
 /* Default: high-contrast dark cab theme (safety yellow on near-black) */

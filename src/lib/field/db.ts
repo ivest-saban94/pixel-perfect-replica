@@ -78,6 +78,10 @@ export async function pendingSorted(): Promise<QueueItem[]> {
   const items = await (await db()).getAllFromIndex("queue", "status", "pending");
   return items.sort((a, b) => a.priority - b.priority || a.createdAt - b.createdAt);
 }
+export async function errorItemsSorted(): Promise<QueueItem[]> {
+  const items = await (await db()).getAllFromIndex("queue", "status", "error");
+  return items.sort((a, b) => b.createdAt - a.createdAt);
+}
 export async function pendingReady(now = Date.now(), ignoreBackoff = false): Promise<QueueItem[]> {
   const items = await pendingSorted();
   if (ignoreBackoff) return items;
@@ -85,4 +89,16 @@ export async function pendingReady(now = Date.now(), ignoreBackoff = false): Pro
 }
 export async function updateItem(item: QueueItem) {
   await (await db()).put("queue", item);
+}
+export async function deleteQueueItem(id: number) {
+  await (await db()).delete("queue", id);
+}
+export async function resetQueueItemToPending(id: number) {
+  const d = await db();
+  const item = (await d.get("queue", id)) as QueueItem | undefined;
+  if (!item) return;
+  item.status = "pending";
+  delete item.error;
+  delete item.nextRetryAt;
+  await d.put("queue", item);
 }
