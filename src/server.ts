@@ -2,6 +2,7 @@ import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
+import { handleOrdersRequest } from "./lib/server/orders";
 import { getSyncDiagnostics, handleSyncRequest, type SyncEnv } from "./lib/server/syncHandler";
 
 type ServerEntry = {
@@ -54,6 +55,9 @@ export default {
       const url = new URL(request.url);
       if (url.pathname === "/api/sync") {
         return await handleSyncRequest(request, env as SyncEnv | undefined);
+      }
+      if (url.pathname === "/api/orders") {
+        return await handleOrdersRequest(request, env as SyncEnv | undefined);
       }
       if (url.pathname === "/api/sync/status" && request.method === "GET") {
         const diagnostics = await getSyncDiagnostics(env as SyncEnv | undefined);

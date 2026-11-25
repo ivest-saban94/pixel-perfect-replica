@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as CraneRouteImport } from './routes/crane'
 import { Route as DepositsRouteImport } from './routes/deposits'
+import { Route as OrdersRouteImport } from './routes/orders'
 import { Route as PodRouteImport } from './routes/pod'
 import { Route as SummaryRouteImport } from './routes/summary'
 import { Route as TachoRouteImport } from './routes/tacho'
@@ -29,6 +30,11 @@ const CraneRoute = CraneRouteImport.update({
 const DepositsRoute = DepositsRouteImport.update({
   id: '/deposits',
   path: '/deposits',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const OrdersRoute = OrdersRouteImport.update({
+  id: '/orders',
+  path: '/orders',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PodRoute = PodRouteImport.update({
@@ -51,6 +57,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/crane': typeof CraneRoute
   '/deposits': typeof DepositsRoute
+  '/orders': typeof OrdersRoute
   '/pod': typeof PodRoute
   '/summary': typeof SummaryRoute
   '/tacho': typeof TachoRoute
@@ -59,6 +66,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/crane': typeof CraneRoute
   '/deposits': typeof DepositsRoute
+  '/orders': typeof OrdersRoute
   '/pod': typeof PodRoute
   '/summary': typeof SummaryRoute
   '/tacho': typeof TachoRoute
@@ -68,22 +76,24 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/crane': typeof CraneRoute
   '/deposits': typeof DepositsRoute
+  '/orders': typeof OrdersRoute
   '/pod': typeof PodRoute
   '/summary': typeof SummaryRoute
   '/tacho': typeof TachoRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/crane' | '/deposits' | '/pod' | '/summary' | '/tacho'
+  fullPaths: '/' | '/crane' | '/deposits' | '/orders' | '/pod' | '/summary' | '/tacho'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/crane' | '/deposits' | '/pod' | '/summary' | '/tacho'
-  id: '__root__' | '/' | '/crane' | '/deposits' | '/pod' | '/summary' | '/tacho'
+  to: '/' | '/crane' | '/deposits' | '/orders' | '/pod' | '/summary' | '/tacho'
+  id: '__root__' | '/' | '/crane' | '/deposits' | '/orders' | '/pod' | '/summary' | '/tacho'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   CraneRoute: typeof CraneRoute
   DepositsRoute: typeof DepositsRoute
+  OrdersRoute: typeof OrdersRoute
   PodRoute: typeof PodRoute
   SummaryRoute: typeof SummaryRoute
   TachoRoute: typeof TachoRoute
@@ -110,6 +120,13 @@ declare module '@tanstack/react-router' {
       path: '/deposits'
       fullPath: '/deposits'
       preLoaderRoute: typeof DepositsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/orders': {
+      id: '/orders'
+      path: '/orders'
+      fullPath: '/orders'
+      preLoaderRoute: typeof OrdersRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/pod': {
@@ -140,6 +157,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   CraneRoute: CraneRoute,
   DepositsRoute: DepositsRoute,
+  OrdersRoute: OrdersRoute,
   PodRoute: PodRoute,
   SummaryRoute: SummaryRoute,
   TachoRoute: TachoRoute,

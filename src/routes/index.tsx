@@ -31,6 +31,7 @@ function Home() {
   const open = !!f.day && !f.day.closeAt;
   const tiles = [
     { to: "/tacho", label: open ? f.t("closeDay") : f.t("openDay"), icon: "⏱", enabled: !f.day?.closeAt },
+    { to: "/orders", label: f.t("orders"), icon: "📋", enabled: true },
     { to: "/pod", label: f.t("scanPod"), icon: "📄", enabled: open },
     { to: "/crane", label: f.t("crane"), icon: "🏗", enabled: open && f.truck.type === "crane" },
     { to: "/deposits", label: f.t("deposits"), icon: "🔁", enabled: open },

@@ -2,6 +2,12 @@ import { z } from "zod";
 import {
   DRIVE_FOLDER,
   SHEET_ID_MAIN,
+  TAB_CRANE,
+  TAB_DEPOSIT_GPS,
+  TAB_LOAD_CONFIRM,
+  TAB_POD,
+  TAB_TACHO,
+  TAB_TACHO_TECHNO,
   driverNameForTruck,
   emailForTruck,
   jerusalemDate,
@@ -10,30 +16,30 @@ import {
   type TruckId,
 } from "@/lib/field/config";
 import { getDriveAppsScriptUrl, uploadDriveFile, validateSafeWebhookUrl } from "./drive";
+import {
+  base64ToBytes,
+  getGoogleAccessToken,
+  getUserOAuthAccessToken,
+  readEnv,
+  type ServiceAccountCreds,
+  type SyncEnv,
+} from "./googleAuth";
+import { sendOrderPush } from "./notifyOrder";
+import { fetchOrdersFromSheet } from "./orders";
 
 export { validateSafeWebhookUrl };
-
-export interface SyncEnv {
-  [key: string]: string | undefined;
-}
-
-const VALID_SHEETS = new Set([
-  "ארכיון_תעודות_גליה",
-  "ארכיון_טכוגרף",
-  "סשנים_PTO",
-  "אתרי_לקוחות",
-  "היסטוריית_ביקורים",
-]);
+export type { SyncEnv };
 
 const SyncPayloadSchema = z
   .object({
-    kind: z.enum(["pod", "tacho", "crane", "deposit", "gps"]),
+    kind: z.enum(["pod", "tacho", "crane", "deposit", "load_confirm", "gps"]),
     key: z.string().trim().min(1).max(200),
     truck: z.string().trim().min(1).max(40),
     driver: z.string().trim().max(120).optional(),
     sheet: z.string().trim().max(80).optional(),
     sheetId: z.string().trim().max(120).optional(),
     docNumber: z.string().trim().max(80).nullable().optional(),
+    orderId: z.string().trim().max(80).optional(),
     customer: z.string().trim().max(200).optional(),
     tons: z.number().finite().nonnegative().nullable().optional(),
     overrideCode: z.string().trim().max(40).nullable().optional(),
@@ -43,7 +49,13 @@ const SyncPayloadSchema = z
     photo: z.string().max(15_000_000).optional(),
     type: z.enum(["open", "close"]).optional(),
     odometer: z.number().finite().nonnegative().optional(),
+    openOdo: z.number().finite().nonnegative().nullable().optional(),
     km: z.number().finite().nonnegative().nullable().optional(),
+    driveHours: z.union([z.number(), z.string()]).optional(),
+    craneHours: z.union([z.number(), z.string()]).optional(),
+    idleHours: z.union([z.number(), z.string()]).optional(),
+    page: z.number().finite().optional(),
+    notes: z.string().max(1000).optional(),
     mode: z.enum(["timer", "ocr"]).optional(),
     start: z.number().finite().optional(),
     end: z.number().finite().optional(),
@@ -51,6 +63,8 @@ const SyncPayloadSchema = z
     startGps: z.array(z.number().nullable().optional()).max(2).optional(),
     endGps: z.array(z.number().nullable().optional()).max(2).nullable().optional(),
     items: z.record(z.string(), z.number().finite().nonnegative()).optional(),
+    lines: z.array(z.record(z.string(), z.unknown())).optional(),
+    deposits: z.array(z.record(z.string(), z.unknown())).optional(),
     twoSites: z.boolean().optional(),
     payment: z
       .object({
@@ -86,60 +100,25 @@ export interface SyncResult {
   error?: string;
 }
 
-interface ServiceAccountCreds {
-  client_email: string;
-  private_key: string;
-  token_uri?: string;
-}
-
 const DEFAULT_EMAIL_FROM = "סבן שטח <onboarding@resend.dev>";
+const TACHO_KEY_INDEX_0 = 15; // Column P (16th column)
 
-const tokenCache = new Map<string, { token: string; exp: number }>();
 const inflightPromises = new Map<string, Promise<{ status: number; body: SyncResult }>>();
 
-function readEnv(name: string, runtimeEnv?: SyncEnv): string | undefined {
-  const fromRuntime = runtimeEnv?.[name];
-  if (typeof fromRuntime === "string" && fromRuntime.trim() !== "") return fromRuntime.trim();
-  const fromProcess = typeof process !== "undefined" ? process.env[name] : undefined;
-  if (typeof fromProcess === "string" && fromProcess.trim() !== "") return fromProcess.trim();
-  return undefined;
-}
-
 export function resolveSheetTab(payload: SyncPayload): string {
-  if (payload.sheet && VALID_SHEETS.has(payload.sheet)) return payload.sheet;
   switch (payload.kind) {
     case "pod":
-      return "ארכיון_תעודות_גליה";
+      return TAB_POD;
     case "tacho":
-      return "ארכיון_טכוגרף";
+      return TAB_TACHO;
     case "crane":
-      return "סשנים_PTO";
+      return TAB_CRANE;
+    case "load_confirm":
+      return TAB_LOAD_CONFIRM;
     case "gps":
-      return "אתרי_לקוחות";
     case "deposit":
-      return "אתרי_לקוחות";
+      return TAB_DEPOSIT_GPS;
   }
-}
-
-function bytesToBase64Url(bytes: Uint8Array): string {
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function utf8ToBase64Url(str: string): string {
-  return bytesToBase64Url(new TextEncoder().encode(str));
-}
-
-function base64ToBytes(base64: string): Uint8Array {
-  const clean = base64.replace(/\s+/g, "");
-  const bin = atob(clean);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
 }
 
 export function parseDataUri(
@@ -150,96 +129,6 @@ export function parseDataUri(
   const mimeType = match?.[1] ?? fallbackMime;
   const base64 = (match?.[2] ?? input).replace(/\s+/g, "");
   return { mimeType, base64, bytes: base64ToBytes(base64) };
-}
-
-async function getUserOAuthAccessToken(
-  clientId: string,
-  clientSecret: string,
-  refreshToken: string,
-): Promise<string> {
-  const cacheKey = `oauth_refresh|${clientId}|${refreshToken.slice(-8)}`;
-  const nowSec = Math.floor(Date.now() / 1000);
-  const cached = tokenCache.get(cacheKey);
-  if (cached && cached.exp > nowSec + 60) return cached.token;
-
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      refresh_token: refreshToken,
-      grant_type: "refresh_token",
-    }),
-  });
-  if (!res.ok) {
-    throw new Error(`Google OAuth refresh token failed (${res.status}): ${await res.text()}`);
-  }
-  const json = (await res.json()) as { access_token: string; expires_in?: number };
-  tokenCache.set(cacheKey, {
-    token: json.access_token,
-    exp: nowSec + (json.expires_in ?? 3600),
-  });
-  return json.access_token;
-}
-
-async function getGoogleAccessToken(creds: ServiceAccountCreds, scopes: string[]): Promise<string> {
-  const cacheKey = `${creds.client_email}|${scopes.join(" ")}`;
-  const nowSec = Math.floor(Date.now() / 1000);
-  const cached = tokenCache.get(cacheKey);
-  if (cached && cached.exp > nowSec + 60) return cached.token;
-
-  const pem = creds.private_key
-    .replace(/\\n/g, "\n")
-    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
-    .replace(/-----END PRIVATE KEY-----/g, "")
-    .replace(/\s+/g, "");
-  const keyBytes = base64ToBytes(pem);
-  const cryptoKey = await crypto.subtle.importKey(
-    "pkcs8",
-    keyBytes.buffer as ArrayBuffer,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-
-  const tokenUri = creds.token_uri || "https://oauth2.googleapis.com/token";
-  const header = utf8ToBase64Url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
-  const claimSet = {
-    iss: creds.client_email,
-    scope: scopes.join(" "),
-    aud: tokenUri,
-    iat: nowSec,
-    exp: nowSec + 3600,
-  };
-
-  const signingInput = `${header}.${utf8ToBase64Url(JSON.stringify(claimSet))}`;
-  const sigBuf = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    cryptoKey,
-    new TextEncoder().encode(signingInput),
-  );
-  const assertion = `${signingInput}.${bytesToBase64Url(new Uint8Array(sigBuf))}`;
-
-  const tokenRes = await fetch(tokenUri, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion,
-    }),
-  });
-  if (!tokenRes.ok) {
-    throw new Error(
-      `Google OAuth token exchange failed (${tokenRes.status}): ${await tokenRes.text()}`,
-    );
-  }
-  const tokenJson = (await tokenRes.json()) as { access_token: string; expires_in?: number };
-  tokenCache.set(cacheKey, {
-    token: tokenJson.access_token,
-    exp: nowSec + (tokenJson.expires_in ?? 3600),
-  });
-  return tokenJson.access_token;
 }
 
 async function resolveOrCreateDriveFolder(
@@ -361,6 +250,7 @@ async function findExistingRowByKey(
   sheetId: string,
   tabName: string,
   key: string,
+  keyColIndex0 = 0,
 ): Promise<{ exists: boolean; existingDriveUrl?: string }> {
   const range = `${tabName}!A:Z`;
   const res = await fetch(
@@ -371,7 +261,7 @@ async function findExistingRowByKey(
     throw new Error(`Google Sheets read failed (${res.status}): ${await res.text()}`);
   }
   const data = (await res.json()) as { values?: string[][] };
-  const matchRow = (data.values ?? []).find((row) => row[0] === key);
+  const matchRow = (data.values ?? []).find((row) => row[keyColIndex0] === key);
   if (!matchRow) return { exists: false };
   const urlCell = matchRow.find(
     (cell) => typeof cell === "string" && cell.startsWith("https://drive.google.com/"),
@@ -391,6 +281,7 @@ export function buildSheetRow(
 
   switch (payload.kind) {
     case "pod":
+      // Columns A-L only; never overwrite columns beyond L
       return [
         payload.key,
         dateStr,
@@ -405,19 +296,37 @@ export function buildSheetRow(
         driveUrl ?? "",
         emailTo,
       ];
-    case "tacho":
+    case "tacho": {
+      const openOdo =
+        payload.type === "open"
+          ? (payload.odometer ?? "")
+          : (payload.openOdo ??
+            (payload.odometer != null && payload.km != null ? payload.odometer - payload.km : ""));
+      const closeOdo = payload.type === "close" ? (payload.odometer ?? "") : "";
+      const extractStatus =
+        payload.type === "open" ? "פתיחת יום" : payload.type === "close" ? "סגירת יום" : "נקלט";
+      // 18 columns A-R; unique key at column P (index 15)
       return [
-        payload.key,
+        jerusalemDate(),
         dateStr,
-        timeStr,
-        payload.truck,
-        driver,
-        payload.type ?? "",
-        payload.odometer ?? "",
+        openOdo,
+        closeOdo,
         payload.km ?? "",
         driveUrl ?? "",
-        emailTo,
+        payload.driveHours ?? "",
+        payload.craneHours ?? "",
+        payload.idleHours ?? "",
+        payload.notes ?? extractStatus,
+        driver,
+        payload.truck,
+        payload.fileName ?? "",
+        payload.page ?? 1,
+        extractStatus,
+        payload.key,
+        "",
+        "",
       ];
+    }
     case "crane":
       return [
         payload.key,
@@ -447,6 +356,19 @@ export function buildSheetRow(
         payload.payment?.method ?? "",
         payload.payment?.amount ?? "",
         driveUrl ?? "",
+      ];
+    case "load_confirm":
+      return [
+        payload.key,
+        dateStr,
+        timeStr,
+        payload.truck,
+        driver,
+        payload.orderId ?? "",
+        payload.docNumber ?? "",
+        JSON.stringify(payload.lines ?? []),
+        JSON.stringify(payload.deposits ?? []),
+        payload.notes ?? "",
       ];
     case "gps":
       return [
@@ -583,7 +505,7 @@ export async function processSyncPayload(
         emailTo: "",
         emailSent: false,
         whatsappSent: false,
-        error: `Invalid payload: ${parsed.error.issues.map((i) => i.message).join("; ")}`,
+        error: `בקשה לא תקינה: ${parsed.error.issues.map((i) => i.message).join("; ")}`,
       },
     };
   }
@@ -678,7 +600,7 @@ export async function processSyncPayload(
         emailSent: false,
         whatsappSent: false,
         error:
-          "Server sync not configured: set GOOGLE_SERVICE_ACCOUNT_JSON or deploy Apps Script and set VITE_SYNC_ENDPOINT",
+          "הסנכרון בשרת אינו מוגדר: יש להגדיר GOOGLE_SERVICE_ACCOUNT_JSON או כתובת Apps Script",
       },
     };
   }
@@ -709,8 +631,18 @@ export async function processSyncPayload(
 
       const sheetId = readEnv("SHEET_ID_MAIN", runtimeEnv) || SHEET_ID_MAIN;
       await ensureSheetTabExists(token, sheetId, targetSheet);
+      if (payload.kind === "tacho") {
+        await ensureSheetTabExists(token, sheetId, TAB_TACHO_TECHNO);
+      }
 
-      const existing = await findExistingRowByKey(token, sheetId, targetSheet, payload.key);
+      const dedupColIndex0 = payload.kind === "tacho" ? TACHO_KEY_INDEX_0 : 0;
+      const existing = await findExistingRowByKey(
+        token,
+        sheetId,
+        targetSheet,
+        payload.key,
+        dedupColIndex0,
+      );
       if (existing.exists) {
         return {
           status: 200,
@@ -740,7 +672,6 @@ export async function processSyncPayload(
         const configuredFolderId = readEnv("DRIVE_FOLDER_ID", runtimeEnv);
 
         if (driveAppsScriptUrl) {
-          // Strategy B (Hybrid): upload via Apps Script (script owner's quota), keep Sheets on SA
           const uploaded = await uploadDriveFile(
             {
               fileName,
@@ -776,11 +707,24 @@ export async function processSyncPayload(
       const row = buildSheetRow(payload, driveUrl, emailTo);
       await appendSheetRow(token, sheetId, targetSheet, row);
 
+      // Tacho double-write into "טכנו" (dedup by column P)
+      if (payload.kind === "tacho") {
+        const existingDup = await findExistingRowByKey(
+          token,
+          sheetId,
+          TAB_TACHO_TECHNO,
+          payload.key,
+          TACHO_KEY_INDEX_0,
+        );
+        if (!existingDup.exists) {
+          await appendSheetRow(token, sheetId, TAB_TACHO_TECHNO, row);
+        }
+      }
+
       let emailSent = false;
       let emailError: string | undefined;
       if (payload.kind === "pod" || payload.kind === "tacho") {
         const copy = buildNotificationCopy(payload, driver, driveUrl);
-        // POD attaches the PDF; tacho uses the Drive link (attaching only if no Drive URL exists)
         const shouldAttach = payload.kind === "pod" || !driveUrl;
         try {
           emailSent = await sendResendEmail(runtimeEnv, {
@@ -867,6 +811,7 @@ export interface SyncDiagnostics {
   notifications: {
     emailProvider: "resend" | "none";
     emailFrom: string;
+    oneSignalConfigured: boolean;
     whatsappConfigured: boolean;
     managerOverrideConfigured: boolean;
   };
@@ -901,6 +846,10 @@ export async function getSyncDiagnostics(runtimeEnv?: SyncEnv): Promise<SyncDiag
     notifications: {
       emailProvider,
       emailFrom: readEnv("EMAIL_FROM", runtimeEnv) || DEFAULT_EMAIL_FROM,
+      oneSignalConfigured: Boolean(
+        (readEnv("ONESIGNAL_APP_ID", runtimeEnv) || readEnv("VITE_ONESIGNAL_APP_ID", runtimeEnv)) &&
+        readEnv("ONESIGNAL_REST_API_KEY", runtimeEnv),
+      ),
       whatsappConfigured: false,
       managerOverrideConfigured: Boolean(readEnv("MANAGER_OVERRIDE_CODE", runtimeEnv)),
     },
@@ -910,9 +859,9 @@ export async function getSyncDiagnostics(runtimeEnv?: SyncEnv): Promise<SyncDiag
   if (!rawSa) return out;
 
   out.serviceAccount.configured = true;
-  let creds: ServiceAccountCreds & { project_id?: string };
+  let creds: ServiceAccountCreds;
   try {
-    creds = JSON.parse(rawSa) as ServiceAccountCreds & { project_id?: string };
+    creds = JSON.parse(rawSa) as ServiceAccountCreds;
     if (creds.project_id) out.serviceAccount.projectId = creds.project_id;
     if (creds.client_email) out.serviceAccount.clientEmail = creds.client_email;
     if (!creds.client_email || !creds.private_key) {
@@ -1027,7 +976,63 @@ export async function handleSyncRequest(request: Request, runtimeEnv?: SyncEnv):
     const rawText = await request.text();
     body = JSON.parse(rawText);
   } catch {
-    return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
+    return Response.json({ ok: false, error: "גוף JSON לא תקין" }, { status: 400 });
+  }
+
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const kind = (body as { kind?: unknown }).kind;
+    if (kind === "orders_list") {
+      try {
+        const reqObj = body as { truck?: string; date?: string };
+        const ordersRes = await fetchOrdersFromSheet(
+          {
+            truck: typeof reqObj.truck === "string" ? reqObj.truck : "",
+            ...(typeof reqObj.date === "string" ? { date: reqObj.date } : {}),
+          },
+          runtimeEnv,
+        );
+        return Response.json(ordersRes, { status: 200 });
+      } catch (err) {
+        return Response.json(
+          {
+            ok: false,
+            orders: [],
+            error: err instanceof Error ? err.message : String(err),
+          },
+          { status: 502 },
+        );
+      }
+    }
+
+    if (kind === "notify_order") {
+      const reqObj = body as {
+        truck?: string;
+        orderId?: string;
+        customerName?: string;
+        address?: string;
+        time?: string;
+        supplyDate?: string;
+      };
+      if (!reqObj.truck || !reqObj.orderId) {
+        return Response.json(
+          { ok: false, error: "חסרים שדות חובה להתראה (truck, orderId)" },
+          { status: 400 },
+        );
+      }
+      const pushRes = await sendOrderPush(
+        reqObj.truck,
+        {
+          orderId: reqObj.orderId,
+          customerName: reqObj.customerName ?? "",
+          truck: reqObj.truck,
+          ...(reqObj.address ? { address: reqObj.address } : {}),
+          ...(reqObj.time ? { time: reqObj.time } : {}),
+          ...(reqObj.supplyDate ? { supplyDate: reqObj.supplyDate } : {}),
+        },
+        runtimeEnv,
+      );
+      return Response.json(pushRes, { status: pushRes.ok || pushRes.skipped ? 200 : 502 });
+    }
   }
 
   const result = await processSyncPayload(body, runtimeEnv);

@@ -1,7 +1,14 @@
 import { openDB, type IDBPDatabase } from "idb";
 
 /** Sync priority: lower uploads first */
-export const PRIORITY = { pod: 1, tacho: 2, crane: 3, deposit: 3, gps: 4 } as const;
+export const PRIORITY = {
+  pod: 1,
+  tacho: 2,
+  crane: 3,
+  deposit: 3,
+  load_confirm: 3,
+  gps: 4,
+} as const;
 export type QueueKind = keyof typeof PRIORITY;
 
 export interface QueueItem {

@@ -129,15 +129,27 @@ describe("syncHandler", () => {
       "https://drive.google.com/file/d/t2/view",
       "lina@saban94.co.il",
     );
-    expect(row[0]).toBe("tacho-close|651-51-701|20261125");
-    expect(row[1]).toBe("20261125");
-    expect(row[3]).toBe("651-51-701");
-    expect(row[4]).toBe("עלי");
-    expect(row[5]).toBe("close");
-    expect(row[6]).toBe(120650);
-    expect(row[7]).toBe(150);
-    expect(row[8]).toBe("https://drive.google.com/file/d/t2/view");
-    expect(row[9]).toBe("lina@saban94.co.il");
+    expect(row).toHaveLength(18);
+    expect(row[1]).toBe("20261125"); // B תאריך דיסקית
+    expect(row[3]).toBe(120650); // D ק"מ סגירה
+    expect(row[4]).toBe(150); // E סה"כ ק"מ
+    expect(row[5]).toBe("https://drive.google.com/file/d/t2/view"); // F קישור לדיסקית
+    expect(row[10]).toBe("עלי"); // K נהג
+    expect(row[11]).toBe("651-51-701"); // L רישוי / משאית
+    expect(row[15]).toBe("tacho-close|651-51-701|20261125"); // P מפתח ייחודי
+
+    // POD must always resolve strictly to ארכיון_תעודות_גליה even if payload.sheet differs
+    expect(
+      resolveSheetTab({
+        kind: "pod",
+        key: "p|1",
+        truck: "615-41-002",
+        sheet: "טכנו",
+      }),
+    ).toBe("ארכיון_תעודות_גליה");
+    expect(resolveSheetTab({ kind: "load_confirm", key: "lc|1", truck: "615-41-002" })).toBe(
+      "אישורי_העמסה",
+    );
   });
 
   it("returns false when RESEND_API_KEY is unset and posts to Resend API when configured", async () => {

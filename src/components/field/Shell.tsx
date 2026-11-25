@@ -17,6 +17,25 @@ export function Shell({ title, children, back = true }: { title: string; childre
         </button>
         <button onClick={f.toggleSun} aria-label={f.t("sun")} className="btn-field min-h-14 border-border bg-secondary">☀</button>
       </header>
+      {f.orderAlert && (
+        <div className="flex items-center gap-3 border-b-[3px] border-border bg-primary px-4 py-3 text-primary-foreground">
+          <Link
+            to="/orders"
+            search={f.orderAlert.orderId ? { orderId: f.orderAlert.orderId } : {}}
+            onClick={f.dismissOrderAlert}
+            className="flex-1 text-xl font-black underline-offset-4 hover:underline"
+          >
+            🔔 {f.orderAlert.title}{f.orderAlert.body ? ` — ${f.orderAlert.body}` : ""}
+          </Link>
+          <button
+            onClick={f.dismissOrderAlert}
+            aria-label="סגור"
+            className="btn-field min-h-12 border-primary-foreground/30 bg-card px-3 text-card-foreground"
+          >
+            ✕
+          </button>
+        </div>
+      )}
       <main className="flex-1 p-4">{children}</main>
       {f.flash && (
         <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-background/60">
