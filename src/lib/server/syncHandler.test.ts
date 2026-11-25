@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
+  getSyncDiagnostics,
   handleSyncRequest,
   parseDataUri,
   processSyncPayload,
@@ -85,5 +86,13 @@ describe("syncHandler", () => {
       new Request("http://localhost/api/sync", { method: "POST", body: "not-json" }),
     );
     expect(badJson.status).toBe(400);
+  });
+
+  it("reports unconfigured diagnostics safely without throwing", async () => {
+    const diag = await getSyncDiagnostics({});
+    expect(diag.ok).toBe(false);
+    expect(diag.serviceAccount.configured).toBe(false);
+    expect(diag.serviceAccount.oauthTokenOk).toBe(false);
+    expect(diag.sheets.sheetId).toBe("1FsLseQrKbIj_AvlE6-dW4J12Gr88P3uaoFVBjEcUjsw");
   });
 });

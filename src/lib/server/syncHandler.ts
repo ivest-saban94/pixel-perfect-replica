@@ -78,7 +78,9 @@ export interface SyncResult {
   sheet: string;
   emailTo: string;
   emailSent: boolean;
+  emailError?: string;
   whatsappSent: boolean;
+  whatsappError?: string;
   error?: string;
 }
 
@@ -89,7 +91,7 @@ interface ServiceAccountCreds {
 }
 
 const tokenCache = new Map<string, { token: string; exp: number }>();
-const inflightKeys = new Set<string>();
+const inflightPromises = new Map<string, Promise<{ status: number; body: SyncResult }>>();
 
 function readEnv(name: string, runtimeEnv?: SyncEnv): string | undefined {
   const fromRuntime = runtimeEnv?.[name];
@@ -759,135 +761,313 @@ export async function processSyncPayload(
     };
   }
 
-  if (inflightKeys.has(payload.key)) {
-    return {
-      status: 409,
-      body: {
-        ok: false,
-        driveUrl: null,
-        duplicate: false,
-        sheet: targetSheet,
-        emailTo,
-        emailSent: false,
-        whatsappSent: false,
-        error: "Sync for this key is already in progress",
-      },
-    };
+  const existingPromise = inflightPromises.get(payload.key);
+  if (existingPromise) {
+    return await existingPromise;
   }
 
-  inflightKeys.add(payload.key);
-  try {
-    const creds = JSON.parse(rawSa) as ServiceAccountCreds;
-    if (!creds.client_email || !creds.private_key) {
-      throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing client_email or private_key");
-    }
+  const work = (async (): Promise<{ status: number; body: SyncResult }> => {
+    try {
+      const creds = JSON.parse(rawSa) as ServiceAccountCreds;
+      if (!creds.client_email || !creds.private_key) {
+        throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON missing client_email or private_key");
+      }
 
-    const token = await getGoogleAccessToken(creds, [
-      "https://www.googleapis.com/auth/drive",
-      "https://www.googleapis.com/auth/spreadsheets",
-    ]);
+      const token = await getGoogleAccessToken(creds, [
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
+      ]);
 
-    const sheetId = readEnv("SHEET_ID_MAIN", runtimeEnv) || SHEET_ID_MAIN;
-    await ensureSheetTabExists(token, sheetId, targetSheet);
+      const sheetId = readEnv("SHEET_ID_MAIN", runtimeEnv) || SHEET_ID_MAIN;
+      await ensureSheetTabExists(token, sheetId, targetSheet);
 
-    const existing = await findExistingRowByKey(token, sheetId, targetSheet, payload.key);
-    if (existing.exists) {
+      const existing = await findExistingRowByKey(token, sheetId, targetSheet, payload.key);
+      if (existing.exists) {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            driveUrl: existing.existingDriveUrl ?? null,
+            duplicate: true,
+            sheet: targetSheet,
+            emailTo,
+            emailSent: false,
+            whatsappSent: false,
+          },
+        };
+      }
+
+      let driveUrl: string | null = null;
+      let attachment: { fileName: string; mimeType: string; base64: string } | undefined;
+
+      const mediaSource = payload.pdf || payload.photo || payload.payment?.receipt;
+      if (mediaSource) {
+        const isPdf = Boolean(payload.pdf);
+        const fallbackMime = isPdf ? "application/pdf" : "image/jpeg";
+        const fileData = parseDataUri(mediaSource, fallbackMime);
+        const fileName =
+          payload.fileName ||
+          `${payload.kind}_${payload.truck}_${jerusalemDate()}.${isPdf ? "pdf" : "jpg"}`;
+        const folderId = await resolveOrCreateDriveFolder(
+          token,
+          payload.folder || DRIVE_FOLDER,
+          readEnv("DRIVE_FOLDER_ID", runtimeEnv),
+        );
+        const uploaded = await uploadFileToDrive(
+          token,
+          fileName,
+          fileData.mimeType,
+          fileData.bytes,
+          folderId,
+        );
+        driveUrl = uploaded.driveUrl;
+        attachment = { fileName, mimeType: fileData.mimeType, base64: fileData.base64 };
+      }
+
+      const row = buildSheetRow(payload, driveUrl, emailTo);
+      await appendSheetRow(token, sheetId, targetSheet, row);
+
+      const copy = buildNotificationCopy(payload, driver, driveUrl);
+      let emailSent = false;
+      let emailError: string | undefined;
+      if (payload.kind === "pod" || payload.kind === "tacho" || payload.notify?.email) {
+        try {
+          emailSent = await sendEmailNotification(creds, runtimeEnv, {
+            to: emailTo,
+            subject: copy.subject,
+            text: copy.text,
+            driveUrl,
+            ...(attachment ? { attachment } : {}),
+          });
+        } catch (err) {
+          emailError = err instanceof Error ? err.message : String(err);
+          console.error("[/api/sync] email notification failed:", emailError);
+        }
+      }
+
+      let whatsappSent = false;
+      let whatsappError: string | undefined;
+      if (payload.notify?.whatsapp && (payload.kind === "pod" || payload.kind === "tacho")) {
+        try {
+          whatsappSent = await sendWhatsAppWebhook(runtimeEnv, {
+            message: copy.text,
+            docNumber: payload.docNumber,
+            driver,
+            truck: payload.truck,
+            driveUrl,
+          });
+        } catch (err) {
+          whatsappError = err instanceof Error ? err.message : String(err);
+          console.error("[/api/sync] whatsapp notification failed:", whatsappError);
+        }
+      }
+
       return {
         status: 200,
         body: {
           ok: true,
-          driveUrl: existing.existingDriveUrl ?? null,
-          duplicate: true,
+          driveUrl,
+          duplicate: false,
+          sheet: targetSheet,
+          emailTo,
+          emailSent,
+          ...(emailError ? { emailError } : {}),
+          whatsappSent,
+          ...(whatsappError ? { whatsappError } : {}),
+        },
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("[/api/sync] failed:", {
+        kind: payload.kind,
+        key: payload.key,
+        sheet: targetSheet,
+        error: message,
+      });
+      return {
+        status: 502,
+        body: {
+          ok: false,
+          driveUrl: null,
+          duplicate: false,
           sheet: targetSheet,
           emailTo,
           emailSent: false,
           whatsappSent: false,
+          error: message,
         },
       };
+    } finally {
+      inflightPromises.delete(payload.key);
     }
+  })();
 
-    let driveUrl: string | null = null;
-    let attachment: { fileName: string; mimeType: string; base64: string } | undefined;
+  inflightPromises.set(payload.key, work);
+  return await work;
+}
 
-    const mediaSource = payload.pdf || payload.photo || payload.payment?.receipt;
-    if (mediaSource) {
-      const isPdf = Boolean(payload.pdf);
-      const fallbackMime = isPdf ? "application/pdf" : "image/jpeg";
-      const fileData = parseDataUri(mediaSource, fallbackMime);
-      const fileName =
-        payload.fileName ||
-        `${payload.kind}_${payload.truck}_${jerusalemDate()}.${isPdf ? "pdf" : "jpg"}`;
-      const folderId = await resolveOrCreateDriveFolder(
-        token,
-        payload.folder || DRIVE_FOLDER,
-        readEnv("DRIVE_FOLDER_ID", runtimeEnv),
-      );
-      const uploaded = await uploadFileToDrive(
-        token,
-        fileName,
-        fileData.mimeType,
-        fileData.bytes,
-        folderId,
-      );
-      driveUrl = uploaded.driveUrl;
-      attachment = { fileName, mimeType: fileData.mimeType, base64: fileData.base64 };
+export interface SyncDiagnostics {
+  ok: boolean;
+  serviceAccount: {
+    configured: boolean;
+    parseError?: string;
+    projectId?: string;
+    clientEmail?: string;
+    oauthTokenOk: boolean;
+    oauthError?: string;
+  };
+  sheets: {
+    sheetId: string;
+    readOk: boolean;
+    title?: string;
+    tabs?: string[];
+    error?: string;
+  };
+  drive: {
+    folderIdConfigured: boolean;
+    folderName: string;
+    accessOk: boolean;
+    folderFound?: boolean;
+    error?: string;
+  };
+  notifications: {
+    emailProvider: "resend" | "webhook" | "gmail" | "none";
+    whatsappConfigured: boolean;
+    managerOverrideConfigured: boolean;
+  };
+}
+
+export async function getSyncDiagnostics(runtimeEnv?: SyncEnv): Promise<SyncDiagnostics> {
+  const sheetId = readEnv("SHEET_ID_MAIN", runtimeEnv) || SHEET_ID_MAIN;
+  const folderId = readEnv("DRIVE_FOLDER_ID", runtimeEnv);
+  const emailProvider: SyncDiagnostics["notifications"]["emailProvider"] = readEnv(
+    "RESEND_API_KEY",
+    runtimeEnv,
+  )
+    ? "resend"
+    : readEnv("EMAIL_WEBHOOK_URL", runtimeEnv)
+      ? "webhook"
+      : readEnv("GMAIL_SENDER_EMAIL", runtimeEnv)
+        ? "gmail"
+        : "none";
+
+  const out: SyncDiagnostics = {
+    ok: false,
+    serviceAccount: {
+      configured: false,
+      oauthTokenOk: false,
+    },
+    sheets: {
+      sheetId,
+      readOk: false,
+    },
+    drive: {
+      folderIdConfigured: Boolean(folderId),
+      folderName: DRIVE_FOLDER,
+      accessOk: false,
+    },
+    notifications: {
+      emailProvider,
+      whatsappConfigured: Boolean(readEnv("WHATSAPP_WEBHOOK_URL", runtimeEnv)),
+      managerOverrideConfigured: Boolean(readEnv("MANAGER_OVERRIDE_CODE", runtimeEnv)),
+    },
+  };
+
+  const rawSa = readEnv("GOOGLE_SERVICE_ACCOUNT_JSON", runtimeEnv);
+  if (!rawSa) return out;
+
+  out.serviceAccount.configured = true;
+  let creds: ServiceAccountCreds & { project_id?: string };
+  try {
+    creds = JSON.parse(rawSa) as ServiceAccountCreds & { project_id?: string };
+    if (creds.project_id) out.serviceAccount.projectId = creds.project_id;
+    if (creds.client_email) out.serviceAccount.clientEmail = creds.client_email;
+    if (!creds.client_email || !creds.private_key) {
+      out.serviceAccount.parseError = "Missing client_email or private_key";
+      return out;
     }
-
-    const row = buildSheetRow(payload, driveUrl, emailTo);
-    await appendSheetRow(token, sheetId, targetSheet, row);
-
-    const copy = buildNotificationCopy(payload, driver, driveUrl);
-    let emailSent = false;
-    if (payload.kind === "pod" || payload.kind === "tacho" || payload.notify?.email) {
-      emailSent = await sendEmailNotification(creds, runtimeEnv, {
-        to: emailTo,
-        subject: copy.subject,
-        text: copy.text,
-        driveUrl,
-        ...(attachment ? { attachment } : {}),
-      });
-    }
-
-    let whatsappSent = false;
-    if (payload.notify?.whatsapp && (payload.kind === "pod" || payload.kind === "tacho")) {
-      whatsappSent = await sendWhatsAppWebhook(runtimeEnv, {
-        message: copy.text,
-        docNumber: payload.docNumber,
-        driver,
-        truck: payload.truck,
-        driveUrl,
-      });
-    }
-
-    return {
-      status: 200,
-      body: {
-        ok: true,
-        driveUrl,
-        duplicate: false,
-        sheet: targetSheet,
-        emailTo,
-        emailSent,
-        whatsappSent,
-      },
-    };
-  } catch (err) {
-    return {
-      status: 502,
-      body: {
-        ok: false,
-        driveUrl: null,
-        duplicate: false,
-        sheet: targetSheet,
-        emailTo,
-        emailSent: false,
-        whatsappSent: false,
-        error: err instanceof Error ? err.message : String(err),
-      },
-    };
-  } finally {
-    inflightKeys.delete(payload.key);
+  } catch (e) {
+    out.serviceAccount.parseError = e instanceof Error ? e.message : String(e);
+    return out;
   }
+
+  let token: string;
+  try {
+    token = await getGoogleAccessToken(creds, [
+      "https://www.googleapis.com/auth/drive",
+      "https://www.googleapis.com/auth/spreadsheets",
+    ]);
+    out.serviceAccount.oauthTokenOk = true;
+  } catch (e) {
+    out.serviceAccount.oauthError = e instanceof Error ? e.message : String(e);
+    return out;
+  }
+
+  try {
+    const metaRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(sheetId)}?fields=properties.title,sheets.properties.title`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!metaRes.ok) {
+      out.sheets.error = `HTTP ${metaRes.status}: ${await metaRes.text()}`;
+    } else {
+      const meta = (await metaRes.json()) as {
+        properties?: { title?: string };
+        sheets?: Array<{ properties?: { title?: string } }>;
+      };
+      out.sheets.readOk = true;
+      if (meta.properties?.title) out.sheets.title = meta.properties.title;
+      out.sheets.tabs = (meta.sheets ?? [])
+        .map((s) => s.properties?.title)
+        .filter((t): t is string => Boolean(t));
+    }
+  } catch (e) {
+    out.sheets.error = e instanceof Error ? e.message : String(e);
+  }
+
+  try {
+    if (folderId) {
+      const fRes = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(folderId)}?fields=id,name,capabilities(canAddChildren)&supportsAllDrives=true`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!fRes.ok) {
+        out.drive.error = `HTTP ${fRes.status}: ${await fRes.text()}`;
+      } else {
+        const fData = (await fRes.json()) as {
+          name?: string;
+          capabilities?: { canAddChildren?: boolean };
+        };
+        out.drive.accessOk = true;
+        out.drive.folderFound = true;
+        if (fData.name) out.drive.folderName = fData.name;
+        if (fData.capabilities?.canAddChildren === false) {
+          out.drive.error =
+            "Service Account lacks write permission (canAddChildren=false) on DRIVE_FOLDER_ID";
+        }
+      }
+    } else {
+      const q = `mimeType = 'application/vnd.google-apps.folder' and name = '${DRIVE_FOLDER.replace(/'/g, "\\'")}' and trashed = false`;
+      const lRes = await fetch(
+        `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name,capabilities(canAddChildren))&supportsAllDrives=true&includeItemsFromAllDrives=true`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!lRes.ok) {
+        out.drive.error = `HTTP ${lRes.status}: ${await lRes.text()}`;
+      } else {
+        const lData = (await lRes.json()) as {
+          files?: Array<{ id: string; capabilities?: { canAddChildren?: boolean } }>;
+        };
+        out.drive.accessOk = true;
+        out.drive.folderFound = Boolean(lData.files && lData.files.length > 0);
+      }
+    }
+  } catch (e) {
+    out.drive.error = e instanceof Error ? e.message : String(e);
+  }
+
+  out.ok = out.serviceAccount.oauthTokenOk && out.sheets.readOk && out.drive.accessOk;
+  return out;
 }
 
 export async function handleSyncRequest(request: Request, runtimeEnv?: SyncEnv): Promise<Response> {

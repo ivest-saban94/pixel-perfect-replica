@@ -2,7 +2,7 @@ import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
-import { handleSyncRequest, type SyncEnv } from "./lib/server/syncHandler";
+import { getSyncDiagnostics, handleSyncRequest, type SyncEnv } from "./lib/server/syncHandler";
 
 type ServerEntry = {
   fetch: (request: Request, env: unknown, ctx: unknown) => Promise<Response> | Response;
@@ -54,6 +54,10 @@ export default {
       const url = new URL(request.url);
       if (url.pathname === "/api/sync") {
         return await handleSyncRequest(request, env as SyncEnv | undefined);
+      }
+      if (url.pathname === "/api/sync/status" && request.method === "GET") {
+        const diagnostics = await getSyncDiagnostics(env as SyncEnv | undefined);
+        return Response.json(diagnostics, { status: diagnostics.ok ? 200 : 503 });
       }
       if (url.pathname === "/api/health") {
         return Response.json({ ok: true });

@@ -67,10 +67,12 @@ export async function drainQueue(force = false): Promise<{ sent: number; left: n
         sent++;
         await updateItem(it);
       } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        console.warn("[sync] retry queued:", it.kind, it.key, message);
         it.attempts++;
         it.lastAttemptAt = Date.now();
         it.nextRetryAt = it.lastAttemptAt + computeBackoffMs(it.attempts);
-        it.error = e instanceof Error ? e.message : String(e);
+        it.error = message;
         await updateItem(it);
         break; // preserve priority order, retry on next tick or online event
       } finally {
