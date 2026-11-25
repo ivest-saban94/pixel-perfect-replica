@@ -24,7 +24,7 @@ import {
   type ServiceAccountCreds,
   type SyncEnv,
 } from "./googleAuth";
-import { sendOrderPush } from "./notifyOrder";
+import { getOneSignalServerConfig, sendOrderPush, sendOrderTestPush } from "./notifyOrder";
 import { fetchOrdersFromSheet } from "./orders";
 
 export { validateSafeWebhookUrl };
@@ -846,10 +846,7 @@ export async function getSyncDiagnostics(runtimeEnv?: SyncEnv): Promise<SyncDiag
     notifications: {
       emailProvider,
       emailFrom: readEnv("EMAIL_FROM", runtimeEnv) || DEFAULT_EMAIL_FROM,
-      oneSignalConfigured: Boolean(
-        (readEnv("ONESIGNAL_APP_ID", runtimeEnv) || readEnv("VITE_ONESIGNAL_APP_ID", runtimeEnv)) &&
-        readEnv("ONESIGNAL_REST_API_KEY", runtimeEnv),
-      ),
+      oneSignalConfigured: getOneSignalServerConfig(runtimeEnv).configured,
       whatsappConfigured: false,
       managerOverrideConfigured: Boolean(readEnv("MANAGER_OVERRIDE_CODE", runtimeEnv)),
     },
@@ -1032,6 +1029,15 @@ export async function handleSyncRequest(request: Request, runtimeEnv?: SyncEnv):
         runtimeEnv,
       );
       return Response.json(pushRes, { status: pushRes.ok || pushRes.skipped ? 200 : 502 });
+    }
+
+    if (kind === "notify_test") {
+      const reqObj = body as { truck?: string };
+      if (!reqObj.truck) {
+        return Response.json({ ok: false, error: "חסר מספר משאית לבדיקה" }, { status: 400 });
+      }
+      const testRes = await sendOrderTestPush(reqObj.truck, runtimeEnv);
+      return Response.json(testRes, { status: testRes.ok || testRes.skipped ? 200 : 502 });
     }
   }
 

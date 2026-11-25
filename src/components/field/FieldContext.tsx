@@ -13,9 +13,14 @@ import { drainQueue, startSyncLoop } from "@/lib/field/sync";
 import { jerusalemDate, TRUCKS, type Truck, type TruckId } from "@/lib/field/config";
 import { tr, type Key, type Lang } from "@/lib/field/i18n";
 import {
+  getOneSignalAppId,
+  getOneSignalStatus,
+  getPendingTruckUser,
   initOneSignal,
   onForegroundOrderNotification,
+  onOneSignalStatusChange,
   setTruckUser,
+  type OneSignalClientStatus,
   type OrderPushData,
 } from "@/lib/field/onesignal";
 
@@ -59,6 +64,8 @@ interface Ctx {
   ordersVersion: number;
   orderAlert: OrderAlertBanner | null;
   dismissOrderAlert: () => void;
+  showOrderAlert: (banner: OrderAlertBanner) => void;
+  oneSignalStatus: OneSignalClientStatus;
 }
 const C = createContext<Ctx | null>(null);
 export const useField = () => {
@@ -81,6 +88,9 @@ export function FieldProvider({ children }: { children: ReactNode }) {
   const [flash, setFlash] = useState(false);
   const [ordersVersion, setOrdersVersion] = useState(0);
   const [orderAlert, setOrderAlert] = useState<OrderAlertBanner | null>(null);
+  const [oneSignalStatus, setOneSignalStatus] = useState<OneSignalClientStatus>(() =>
+    getOneSignalStatus(),
+  );
 
   const refreshPending = useCallback(() => {
     void pendingSorted().then((p) => setPending(p.length));
@@ -116,12 +126,30 @@ export function FieldProvider({ children }: { children: ReactNode }) {
       setSun((await kvGet<boolean>("sun")) ?? false);
       const savedTruck = (await kvGet<TruckId>("truck")) ?? null;
       setTruckId(savedTruck);
-      if (savedTruck) setTruckUser(savedTruck);
+      if (savedTruck) {
+        const driverName = TRUCKS.find((x) => x.id === savedTruck)?.driver;
+        setTruckUser(savedTruck, driverName);
+      }
       await loadTruckShift(savedTruck);
       setReady(true);
       refreshPending();
     })();
     initOneSignal();
+    if (!getOneSignalAppId()) {
+      void fetch("/api/notify/status")
+        .then((r) => (r.ok ? (r.json() as Promise<{ appId?: string | null }>) : null))
+        .then((data) => {
+          if (data?.appId) {
+            initOneSignal(data.appId);
+            const pendingTruck = getPendingTruckUser();
+            if (pendingTruck.truckId) {
+              setTruckUser(pendingTruck.truckId, pendingTruck.driverName);
+            }
+          }
+        })
+        .catch(() => undefined);
+    }
+    const unsubStatus = onOneSignalStatusChange(setOneSignalStatus);
     const unsubPush = onForegroundOrderNotification((data: OrderPushData) => {
       setOrderAlert({
         title: data.title || (data.orderId ? `הזמנה חדשה · ${data.orderId}` : "הזמנה חדשה"),
@@ -139,6 +167,7 @@ export function FieldProvider({ children }: { children: ReactNode }) {
     const stop = startSyncLoop();
     const t = setInterval(refreshPending, 5000);
     return () => {
+      unsubStatus();
       unsubPush();
       stop();
       clearInterval(t);
@@ -175,7 +204,8 @@ export function FieldProvider({ children }: { children: ReactNode }) {
       setTruckId(id);
       setTruckPickerOpen(false);
       void kvSet("truck", id);
-      if (id) setTruckUser(id);
+      const driverName = id ? TRUCKS.find((x) => x.id === id)?.driver : undefined;
+      setTruckUser(id, driverName);
       void loadTruckShift(id);
     },
     [loadTruckShift],
@@ -238,6 +268,8 @@ export function FieldProvider({ children }: { children: ReactNode }) {
     ordersVersion,
     orderAlert,
     dismissOrderAlert: () => setOrderAlert(null),
+    showOrderAlert: (banner) => setOrderAlert(banner),
+    oneSignalStatus,
     setLang: (l) => {
       setLangS(l);
       void kvSet("lang", l);

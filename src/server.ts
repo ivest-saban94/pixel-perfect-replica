@@ -2,6 +2,7 @@ import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
+import { getOneSignalServerConfig, sendOrderTestPush } from "./lib/server/notifyOrder";
 import { handleOrdersRequest } from "./lib/server/orders";
 import { getSyncDiagnostics, handleSyncRequest, type SyncEnv } from "./lib/server/syncHandler";
 
@@ -58,6 +59,25 @@ export default {
       }
       if (url.pathname === "/api/orders") {
         return await handleOrdersRequest(request, env as SyncEnv | undefined);
+      }
+      if (url.pathname === "/api/notify/status" && request.method === "GET") {
+        const cfg = getOneSignalServerConfig(env as SyncEnv | undefined);
+        return Response.json({
+          ok: true,
+          configured: cfg.configured,
+          appIdSet: Boolean(cfg.appId),
+          restKeySet: Boolean(cfg.restApiKey),
+          appId: cfg.appId ?? null,
+        });
+      }
+      if (url.pathname === "/api/notify/test" && request.method === "POST") {
+        const body = (await request.json().catch(() => ({}))) as { truck?: string };
+        const truck = typeof body.truck === "string" ? body.truck.trim() : "";
+        if (!truck) {
+          return Response.json({ ok: false, error: "חסר מספר משאית" }, { status: 400 });
+        }
+        const res = await sendOrderTestPush(truck, env as SyncEnv | undefined);
+        return Response.json(res, { status: res.ok || res.skipped ? 200 : 502 });
       }
       if (url.pathname === "/api/sync/status" && request.method === "GET") {
         const diagnostics = await getSyncDiagnostics(env as SyncEnv | undefined);

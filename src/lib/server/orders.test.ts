@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { matchLoadToPod } from "@/lib/field/loadMatch";
-import { clearSentOrderNotificationsForTest, sendOrderPush } from "./notifyOrder";
+import {
+  buildOneSignalAuthHeader,
+  clearSentOrderNotificationsForTest,
+  deterministicIdempotencyUuid,
+  sendOrderPush,
+  sendOrderTestPush,
+} from "./notifyOrder";
 import { buildOrdersFromSheetValues, normalizeSheetDate, parseProductsRaw } from "./orders";
 
 describe("orders, load matching, and OneSignal push", () => {
@@ -221,5 +227,54 @@ describe("orders, load matching, and OneSignal push", () => {
       dedupKey: "ORD-77|615-41-002|20261125",
     });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    const callInit = fetchSpy.mock.calls[0]?.[1];
+    const sentBody = JSON.parse(String(callInit?.body)) as {
+      include_aliases?: { external_id?: string[] };
+      idempotency_key?: string;
+    };
+    expect(sentBody.include_aliases).toEqual({ external_id: ["615-41-002"] });
+    expect(sentBody.idempotency_key).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(sentBody.idempotency_key).toBe(
+      deterministicIdempotencyUuid("ORD-77|615-41-002|20261125"),
+    );
+  });
+
+  it("supports os_v2 Key auth, handles HTTP 200 OneSignal errors without caching dedup, and sends test pushes", async () => {
+    expect(buildOneSignalAuthHeader("os_v2_app_secret")).toBe("Key os_v2_app_secret");
+    expect(buildOneSignalAuthHeader("legacy_rest_key")).toBe("Basic legacy_rest_key");
+
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ id: "", errors: ["All included players are not subscribed"] }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "notif_test_2" }), { status: 200 }));
+
+    const env = { ONESIGNAL_APP_ID: "app_123", ONESIGNAL_REST_API_KEY: "os_v2_app_secret" };
+    const unsubscribed = await sendOrderPush(
+      "651-51-701",
+      {
+        orderId: "ORD-88",
+        customerName: "בדיקה",
+        supplyDate: "20261125",
+        truck: "651-51-701",
+      },
+      env,
+    );
+    expect(unsubscribed.ok).toBe(false);
+    expect(unsubscribed.sent).toBe(false);
+    expect(unsubscribed.error).toContain("טרם נרשמה");
+
+    const testPush = await sendOrderTestPush("651-51-701", env);
+    expect(testPush.ok).toBe(true);
+    expect(testPush.sent).toBe(true);
+    expect(testPush.notificationId).toBe("notif_test_2");
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 });

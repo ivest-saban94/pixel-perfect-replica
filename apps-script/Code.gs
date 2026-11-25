@@ -147,6 +147,13 @@ function doPost(e) {
       return jsonResponse(sendOrderPush_(payload.truck, payload, props));
     }
 
+    if (payload.kind === "notify_test") {
+      if (!payload.truck) {
+        return jsonResponse({ ok: false, error: "חסר מספר משאית לבדיקה" });
+      }
+      return jsonResponse(testOrderPush(payload.truck));
+    }
+
     if (!VALID_KINDS[payload.kind]) {
       return jsonResponse({ ok: false, error: "סוג פעולה לא חוקי: " + payload.kind });
     }
@@ -845,57 +852,109 @@ function readOrders_(truck, date) {
 // 7. OneSignal Push + Time-Driven Trigger (checkNewOrdersAndNotify)
 // ============================================================
 
-function sendOrderPush_(truck, order, props) {
+function deterministicUuid_(seed) {
+  function mix(init, salt) {
+    let h = init >>> 0;
+    for (let i = 0; i < seed.length; i++) {
+      h ^= seed.charCodeAt(i) + ((salt + i) << 5);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+  }
+  function hex(n, len) {
+    return ("00000000" + n.toString(16)).slice(-len);
+  }
+  return (
+    hex(mix(0x811c9dc5, 11), 8) +
+    "-" +
+    hex(mix(0x9e3779b9, 23) & 0xffff, 4) +
+    "-" +
+    hex(0x4000 | (mix(0x85ebca6b, 37) & 0x0fff), 4) +
+    "-" +
+    hex(0x8000 | (mix(0xc2b2ae35, 53) & 0x3fff), 4) +
+    "-" +
+    hex(mix(0x27d4eb2f, 71), 8) +
+    hex(mix(0x165667b1, 97) & 0xffff, 4)
+  );
+}
+
+function cleanupOldPushKeys_(props, keepDateStr) {
+  const yesterday = formatDate_(new Date(Date.now() - 86400000));
+  const all = props.getProperties();
+  const keys = Object.keys(all);
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    if (k.indexOf("ONESIGNAL_SENT_") === 0) {
+      const d = k.replace("ONESIGNAL_SENT_", "");
+      if (d !== keepDateStr && d !== yesterday) {
+        props.deleteProperty(k);
+      }
+    }
+  }
+}
+
+function sendOrderPush_(truck, order, props, bypassDedup, isTest) {
   const scriptProps = props || PropertiesService.getScriptProperties();
   const truckId = resolveTruckFromLabel_(truck) || String(truck || "").trim();
   const dateStr = normalizeSheetDate_(order.supplyDate) || formatDate_(new Date());
   const dedupKey = String(order.orderId) + "|" + truckId + "|" + dateStr;
 
   const cachePropKey = "ONESIGNAL_SENT_" + dateStr;
-  const sentMapRaw = scriptProps.getProperty(cachePropKey) || "{}";
-  let sentMap;
-  try {
-    sentMap = JSON.parse(sentMapRaw);
-  } catch (_e) {
-    sentMap = {};
-  }
-  if (sentMap[dedupKey]) {
-    return { ok: true, sent: false, duplicate: true, dedupKey: dedupKey };
+  let sentMap = {};
+  if (!bypassDedup) {
+    const sentMapRaw = scriptProps.getProperty(cachePropKey) || "{}";
+    try {
+      sentMap = JSON.parse(sentMapRaw);
+    } catch (_e) {
+      sentMap = {};
+    }
+    if (sentMap[dedupKey]) {
+      return { ok: true, sent: false, duplicate: true, dedupKey: dedupKey };
+    }
   }
 
   const appId = scriptProps.getProperty("ONESIGNAL_APP_ID");
-  const restKey = scriptProps.getProperty("ONESIGNAL_REST_API_KEY");
+  const restKey = scriptProps.getProperty("ONESIGNAL_REST_API_KEY") || scriptProps.getProperty("ONESIGNAL_API_KEY");
   if (!appId || !restKey) {
     return { ok: false, sent: false, skipped: true, dedupKey: dedupKey, error: "OneSignal לא מוגדר ב-Script Properties" };
   }
 
-  const title = "הזמנה חדשה · " + order.orderId;
+  const title = isTest ? "בדיקת התראה · סבן שטח (" + truckId + ")" : "הזמנה חדשה · " + order.orderId;
   const bodyParts = [order.customerName, order.address, order.time]
     .map(function (v) {
       return String(v || "").trim();
     })
     .filter(Boolean);
-  const bodyText = bodyParts.join(" · ") || "הזמנה חדשה שובצה למשאית שלך";
+  const bodyText = bodyParts.join(" · ") || (isTest ? "חיבור OneSignal תקין למשאית הפעילה" : "הזמנה חדשה שובצה למשאית שלך");
+
+  const authHeader = restKey.trim().indexOf("os_v2_") === 0 ? "Key " + restKey.trim() : "Basic " + restKey.trim();
+  const payloadObj = {
+    app_id: appId,
+    include_aliases: { external_id: [truckId] },
+    target_channel: "push",
+    headings: { en: title, he: title },
+    contents: { en: bodyText, he: bodyText },
+    chrome_web_icon: "/pwa-192x192.png",
+    chrome_web_badge: "/pwa-192x192.png",
+    ttl: 3600,
+    collapse_id: isTest ? "test_" + truckId : "order_" + order.orderId,
+    data: {
+      type: isTest ? "test" : "order",
+      orderId: String(order.orderId),
+      truck: truckId,
+      url: isTest ? "/orders" : "/orders?orderId=" + encodeURIComponent(String(order.orderId)),
+    },
+    priority: 10,
+  };
+  if (!bypassDedup) {
+    payloadObj.idempotency_key = deterministicUuid_(dedupKey);
+  }
 
   const res = UrlFetchApp.fetch("https://api.onesignal.com/notifications", {
     method: "post",
     contentType: "application/json",
-    headers: { Authorization: "Basic " + restKey },
-    payload: JSON.stringify({
-      app_id: appId,
-      include_external_user_ids: [truckId],
-      target_channel: "push",
-      idempotency_key: dedupKey,
-      headings: { he: title, en: title },
-      contents: { he: bodyText, en: bodyText },
-      data: {
-        type: "order",
-        orderId: String(order.orderId),
-        truck: truckId,
-        url: "/orders?orderId=" + encodeURIComponent(String(order.orderId)),
-      },
-      priority: 10,
-    }),
+    headers: { Authorization: authHeader },
+    payload: JSON.stringify(payloadObj),
     muteHttpExceptions: true,
   });
 
@@ -908,9 +967,46 @@ function sendOrderPush_(truck, order, props) {
     };
   }
 
-  sentMap[dedupKey] = true;
-  scriptProps.setProperty(cachePropKey, JSON.stringify(sentMap));
-  return { ok: true, sent: true, dedupKey: dedupKey };
+  let resJson = {};
+  try {
+    resJson = JSON.parse(res.getContentText() || "{}");
+  } catch (_e2) {
+    resJson = {};
+  }
+  const hasErrors = Array.isArray(resJson.errors)
+    ? resJson.errors.length > 0
+    : Boolean(resJson.errors && typeof resJson.errors === "object" && Object.keys(resJson.errors).length > 0);
+  if (hasErrors || !resJson.id) {
+    return {
+      ok: false,
+      sent: false,
+      dedupKey: dedupKey,
+      error: "המשאית טרם נרשמה להתראות בדפדפן",
+      details: resJson.errors || resJson,
+    };
+  }
+
+  if (!bypassDedup) {
+    sentMap[dedupKey] = true;
+    scriptProps.setProperty(cachePropKey, JSON.stringify(sentMap));
+  }
+  return { ok: true, sent: true, dedupKey: dedupKey, notificationId: resJson.id };
+}
+
+function testOrderPush(truck) {
+  const props = PropertiesService.getScriptProperties();
+  const targetTruck = truck || "615-41-002";
+  return sendOrderPush_(
+    targetTruck,
+    {
+      orderId: "TEST-" + Date.now(),
+      customerName: "בדיקת מערכת סבן שטח",
+      address: "משאית " + targetTruck,
+    },
+    props,
+    true,
+    true
+  );
 }
 
 /**
@@ -919,12 +1015,13 @@ function sendOrderPush_(truck, order, props) {
 function checkNewOrdersAndNotify() {
   const props = PropertiesService.getScriptProperties();
   const today = formatDate_(new Date());
+  cleanupOldPushKeys_(props, today);
   const data = readOrders_("", today);
   const results = [];
   for (let i = 0; i < data.orders.length; i++) {
     const ord = data.orders[i];
     if (!ord.truckId) continue;
-    results.push(sendOrderPush_(ord.truckId, ord, props));
+    results.push(sendOrderPush_(ord.truckId, ord, props, false, false));
   }
   return { ok: true, checked: data.orders.length, results: results };
 }

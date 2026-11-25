@@ -4,7 +4,7 @@ import { useField } from "@/components/field/FieldContext";
 import { Shell } from "@/components/field/Shell";
 import { SHEET_ID_MAIN, TAB_LOAD_CONFIRM, jerusalemDate, uniqueKey } from "@/lib/field/config";
 import { enqueue, kvGet, kvSet } from "@/lib/field/db";
-import { getOneSignalAppId, requestPushPermission } from "@/lib/field/onesignal";
+import { playOrderAlertSound, requestPushPermission } from "@/lib/field/onesignal";
 import { getSyncEndpoint } from "@/lib/field/sync";
 import type { Order } from "@/lib/server/orders";
 
@@ -78,7 +78,8 @@ function OrdersScreen() {
     updatedAt: 0,
   });
   const [activeLineIdx, setActiveLineIdx] = useState<number>(0);
-  const [alertsEnabled, setAlertsEnabled] = useState<boolean>(false);
+  const [pushFeedback, setPushFeedback] = useState<string | null>(null);
+  const [testingPush, setTestingPush] = useState(false);
 
   const lineRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
@@ -116,12 +117,6 @@ function OrdersScreen() {
       setSelectedOrderId(search.orderId);
     }
   }, [search.orderId]);
-
-  useEffect(() => {
-    if (typeof Notification !== "undefined") {
-      setAlertsEnabled(Notification.permission === "granted");
-    }
-  }, []);
 
   const selectedOrder = orders.find((o) => o.orderId === selectedOrderId) ?? null;
 
@@ -269,7 +264,49 @@ function OrdersScreen() {
     void navigate({ to: "/pod", search: { orderId: selectedOrder.orderId } });
   };
 
-  const oneSignalConfigured = Boolean(getOneSignalAppId());
+  const sendTestAlert = async () => {
+    if (!f.truck) return;
+    setTestingPush(true);
+    setPushFeedback(null);
+    playOrderAlertSound();
+    f.showOrderAlert({
+      title: `${f.t("testPush")} · ${f.truck.id}`,
+      body: f.truck.driver,
+    });
+
+    try {
+      const endpoint = getSyncEndpoint();
+      const isExternalScript = endpoint.startsWith("http://") || endpoint.startsWith("https://");
+      const res = isExternalScript
+        ? await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "text/plain" },
+            body: JSON.stringify({ kind: "notify_test", truck: f.truck.id }),
+          })
+        : await fetch("/api/notify/test", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ truck: f.truck.id }),
+          });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        sent?: boolean;
+        skipped?: boolean;
+        error?: string;
+      };
+      if (data.sent) {
+        setPushFeedback(`✓ ${f.t("testPushSent")}`);
+      } else {
+        setPushFeedback(data.error || f.t("alertsNotConfigured"));
+      }
+    } catch (err) {
+      setPushFeedback(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTestingPush(false);
+    }
+  };
+
+  const osStatus = f.oneSignalStatus;
 
   if (selectedOrder) {
     const confirmedCount = selectedOrder.lines.filter(
@@ -494,21 +531,38 @@ function OrdersScreen() {
           <button
             onClick={() => void loadOrders(true)}
             disabled={loading}
-            className="btn-field flex-1 border-primary bg-primary text-primary-foreground text-2xl"
+            className="btn-field flex-1 border-brand bg-brand text-brand-foreground text-2xl"
           >
             🔄 {loading ? f.t("loadingOrders") : f.t("refresh")}
           </button>
-          {oneSignalConfigured && !alertsEnabled && (
+          {osStatus.sdkConfigured && !osStatus.subscribed && (
             <button
-              onClick={async () => {
-                const ok = await requestPushPermission();
-                setAlertsEnabled(ok);
-              }}
-              className="btn-field border-accent bg-accent text-accent-foreground text-xl"
+              onClick={() => void requestPushPermission()}
+              className="btn-field border-success bg-success text-success-foreground text-xl"
             >
               🔔 {f.t("enableAlerts")}
             </button>
           )}
+          <button
+            type="button"
+            disabled={testingPush}
+            onClick={() => void sendTestAlert()}
+            className="btn-field border-border bg-secondary text-lg"
+          >
+            📣 {testingPush ? "…" : f.t("testPush")}
+          </button>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border-2 border-border bg-card px-4 py-2 text-base font-bold">
+          <span>
+            {osStatus.subscribed
+              ? `✅ ${f.t("alertsActive")} (${osStatus.externalId || f.truck.id})`
+              : osStatus.sdkConfigured
+                ? `⚠ ${f.t("alertsWaiting")}`
+                : `ℹ ${f.t("alertsNotConfigured")}`}
+          </span>
+          {osStatus.initError && <span className="text-destructive">{osStatus.initError}</span>}
+          {pushFeedback && <span className="text-muted-foreground">{pushFeedback}</span>}
         </div>
 
         {error && (
