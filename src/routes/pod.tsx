@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useField } from "@/components/field/FieldContext";
 import { BigInput, PhotoButton, Shell } from "@/components/field/Shell";
@@ -34,6 +34,7 @@ interface ActivePodOrder extends OrderRef, LoadConfirmationSummary {}
 function Pod() {
   const f = useField();
   const search = Route.useSearch();
+  const navigate = useNavigate();
   const [pages, setPages] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [doc, setDoc] = useState("");
@@ -59,7 +60,7 @@ function Pod() {
 
   if (!f.truck) return null;
   const heavy = tons !== "" && overWeight(f.truck.id, Number(tons));
-  const overrideOk = !heavy || code.length >= 4; // validated server-side against manager code
+  const overrideOk = !heavy || code.length >= 4;
   const valid = pages.length > 0 && doc.trim() && cust.trim() && overrideOk;
 
   const matchResult =
@@ -91,6 +92,30 @@ function Pod() {
       notify: { email: emailForTruck(f.truck!.id) },
     });
     await kvSet("podCount", ((await kvGet<number>("podCount")) ?? 0) + 1);
+
+    try {
+      const overlayNote = {
+        id: `pod-${uniqueKey(doc)}`,
+        docNumber: doc,
+        customerName: cust,
+        truckId: f.truck!.id,
+        driverName: f.truck!.driver,
+        lines: [] as Array<{ sku: string; description: string; qty: number }>,
+        deposits: [
+          { sku: "60002", description: "שק גדול (בלה)", qty: 0 },
+          { sku: "60060", description: "משטח סבן", qty: 0 },
+          { sku: "60006", description: "משטח בלוקים", qty: 0 },
+        ],
+        tons: tons ? Number(tons) : null,
+        extractedAt: new Date().toISOString(),
+        sourceFileUrl: undefined as string | undefined,
+      };
+      sessionStorage.setItem(`delivery:${overlayNote.id}`, JSON.stringify(overlayNote));
+      sessionStorage.setItem("delivery:lastPodId", overlayNote.id);
+    } catch {
+      /* kiosk may block sessionStorage */
+    }
+
     f.confirm();
     setPages([]);
     setDoc("");
@@ -99,6 +124,31 @@ function Pod() {
     setCode("");
     setLinkedOrder(null);
     setBusy(false);
+  }
+
+  function openOverlayFromPod() {
+    const lastId = sessionStorage.getItem("delivery:lastPodId");
+    if (lastId && sessionStorage.getItem(`delivery:${lastId}`)) {
+      navigate({ to: "/delivery-overlay", search: { id: lastId } });
+      return;
+    }
+    const overlayNote = {
+      id: `pod-draft-${Date.now()}`,
+      docNumber: doc || "",
+      customerName: cust || "",
+      truckId: f.truck!.id,
+      driverName: f.truck!.driver,
+      lines: [] as Array<{ sku: string; description: string; qty: number }>,
+      deposits: [
+        { sku: "60002", description: "שק גדול (בלה)", qty: 0 },
+        { sku: "60060", description: "משטח סבן", qty: 0 },
+        { sku: "60006", description: "משטח בלוקים", qty: 0 },
+      ],
+      tons: tons ? Number(tons) : null,
+      extractedAt: new Date().toISOString(),
+    };
+    sessionStorage.setItem(`delivery:${overlayNote.id}`, JSON.stringify(overlayNote));
+    navigate({ to: "/delivery-overlay", search: { id: overlayNote.id } });
   }
 
   return (
@@ -186,6 +236,16 @@ function Pod() {
         >
           {busy ? "…" : f.t("createPdf")}
         </button>
+        <button
+          type="button"
+          onClick={openOverlayFromPod}
+          className="btn-field border-accent bg-accent text-accent-foreground text-xl"
+        >
+          שכבת נהג (מנוף / המתנה / פקדונות)
+        </button>
+        <Link to="/delivery-overlay" className="text-center text-base underline opacity-80">
+          פתיחת מסך שכבת תעודה מלא
+        </Link>
       </div>
     </Shell>
   );
