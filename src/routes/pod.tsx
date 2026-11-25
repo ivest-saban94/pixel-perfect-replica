@@ -33,7 +33,7 @@ function Pod() {
     await enqueue("pod", uniqueKey(doc), {
       truck: f.truck!.id, driver: f.truck!.driver, docNumber: doc, customer: cust, tons: tons ? Number(tons) : null,
       overrideCode: heavy ? code : null, fileName, folder: DRIVE_FOLDER, pdf, at: Date.now(),
-      sheetId: SHEET_ID_MAIN, sheet: "ארכיון_תעודות_גליה", notify: { whatsapp: true, email: emailForTruck(f.truck!.id) },
+      sheetId: SHEET_ID_MAIN, sheet: "ארכיון_תעודות_גליה", notify: { email: emailForTruck(f.truck!.id) },
     });
     await kvSet("podCount", ((await kvGet<number>("podCount")) ?? 0) + 1);
     f.confirm(); setPages([]); setDoc(""); setCust(""); setTons(""); setCode(""); setBusy(false);

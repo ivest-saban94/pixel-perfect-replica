@@ -80,7 +80,6 @@ export interface SyncResult {
   emailSent: boolean;
   emailError?: string;
   whatsappSent: boolean;
-  whatsappError?: string;
   error?: string;
 }
 
@@ -89,6 +88,8 @@ interface ServiceAccountCreds {
   private_key: string;
   token_uri?: string;
 }
+
+const DEFAULT_EMAIL_FROM = "סבן שטח <onboarding@resend.dev>";
 
 const tokenCache = new Map<string, { token: string; exp: number }>();
 const inflightPromises = new Map<string, Promise<{ status: number; body: SyncResult }>>();
@@ -120,7 +121,7 @@ export function resolveSheetTab(payload: SyncPayload): string {
 export function validateSafeWebhookUrl(rawUrl: string): URL {
   const parsed = new URL(rawUrl);
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new Error("Webhook URL must use http or https");
+    throw new Error("URL must use http or https");
   }
   const host = parsed.hostname.toLowerCase();
   if (
@@ -135,7 +136,7 @@ export function validateSafeWebhookUrl(rawUrl: string): URL {
     host.endsWith(".internal") ||
     host.endsWith(".local")
   ) {
-    throw new Error("Webhook URL targets a restricted network address");
+    throw new Error("URL targets a restricted network address");
   }
   return parsed;
 }
@@ -161,15 +162,6 @@ function base64ToBytes(base64: string): Uint8Array {
   return out;
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary);
-}
-
 export function parseDataUri(
   input: string,
   fallbackMime: string,
@@ -180,12 +172,39 @@ export function parseDataUri(
   return { mimeType, base64, bytes: base64ToBytes(base64) };
 }
 
-async function getGoogleAccessToken(
-  creds: ServiceAccountCreds,
-  scopes: string[],
-  subjectEmail?: string,
+async function getUserOAuthAccessToken(
+  clientId: string,
+  clientSecret: string,
+  refreshToken: string,
 ): Promise<string> {
-  const cacheKey = `${creds.client_email}|${scopes.join(" ")}|${subjectEmail ?? ""}`;
+  const cacheKey = `oauth_refresh|${clientId}|${refreshToken.slice(-8)}`;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const cached = tokenCache.get(cacheKey);
+  if (cached && cached.exp > nowSec + 60) return cached.token;
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token",
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Google OAuth refresh token failed (${res.status}): ${await res.text()}`);
+  }
+  const json = (await res.json()) as { access_token: string; expires_in?: number };
+  tokenCache.set(cacheKey, {
+    token: json.access_token,
+    exp: nowSec + (json.expires_in ?? 3600),
+  });
+  return json.access_token;
+}
+
+async function getGoogleAccessToken(creds: ServiceAccountCreds, scopes: string[]): Promise<string> {
+  const cacheKey = `${creds.client_email}|${scopes.join(" ")}`;
   const nowSec = Math.floor(Date.now() / 1000);
   const cached = tokenCache.get(cacheKey);
   if (cached && cached.exp > nowSec + 60) return cached.token;
@@ -206,14 +225,13 @@ async function getGoogleAccessToken(
 
   const tokenUri = creds.token_uri || "https://oauth2.googleapis.com/token";
   const header = utf8ToBase64Url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
-  const claimSet: Record<string, unknown> = {
+  const claimSet = {
     iss: creds.client_email,
     scope: scopes.join(" "),
     aud: tokenUri,
     iat: nowSec,
     exp: nowSec + 3600,
   };
-  if (subjectEmail) claimSet["sub"] = subjectEmail;
 
   const signingInput = `${header}.${utf8ToBase64Url(JSON.stringify(claimSet))}`;
   const sigBuf = await crypto.subtle.sign(
@@ -381,7 +399,7 @@ async function findExistingRowByKey(
   return urlCell ? { exists: true, existingDriveUrl: urlCell } : { exists: true };
 }
 
-function buildSheetRow(
+export function buildSheetRow(
   payload: SyncPayload,
   driveUrl: string | null,
   emailTo: string,
@@ -487,7 +505,7 @@ async function appendSheetRow(
   }
 }
 
-function buildNotificationCopy(
+export function buildNotificationCopy(
   payload: SyncPayload,
   driver: string,
   driveUrl: string | null,
@@ -495,200 +513,76 @@ function buildNotificationCopy(
   if (payload.kind === "tacho") {
     const phase = payload.type === "open" ? "פתיחת יום" : "סגירת יום";
     const subject = `טכוגרף ${phase} · משאית ${payload.truck} (${driver})`;
-    const text = [
+    const lines = [
       `⏱ טכוגרף ${phase}`,
       `🚚 משאית: ${payload.truck} (${driver})`,
-      `🔢 מד אוץ: ${payload.odometer ?? "—"}${payload.km != null ? ` | ק״מ היום: ${payload.km}` : ""}`,
-      driveUrl ? `🔗 קישור לדרייב: ${driveUrl}` : "",
-    ]
-      .filter(Boolean)
-      .join("\n");
-    return { subject, text };
+      `🔢 מד אוץ: ${payload.odometer ?? "—"}`,
+      payload.type === "close" && payload.km != null ? `📏 ק״מ היום: ${payload.km}` : "",
+      driveUrl ? `🔗 צפייה בצילום הדיסקית: ${driveUrl}` : "",
+      "",
+      "בברכה,",
+      "מערכת סבן שטח",
+    ].filter((line, idx, arr) => line !== "" || (idx > 0 && arr[idx - 1] !== ""));
+    return { subject, text: lines.join("\n") };
   }
 
-  const subject =
-    `תעודת משלוח ${payload.docNumber ?? ""} · ${payload.customer ?? ""} · ${driver}`.trim();
-  const text = [
-    `📄 תעודת משלוח: ${payload.docNumber ?? "—"}${payload.customer ? ` | לקוח: ${payload.customer}` : ""}`,
+  const doc = payload.docNumber ?? "—";
+  const customer = payload.customer ?? "—";
+  const subject = `תעודת משלוח ${doc} · ${customer} · ${driver}`;
+  const lines = [
+    "שלום,",
+    "מצורפת תעודת משלוח לעיונך.",
+    "",
+    `📄 מספר תעודה: ${doc}`,
+    `👤 לקוח: ${customer}`,
     `🚚 משאית: ${payload.truck} (${driver})`,
     payload.tons != null ? `⚖️ משקל: ${payload.tons} טון` : "",
     driveUrl ? `🔗 קישור לדרייב: ${driveUrl}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
-  return { subject, text };
+    "",
+    "בברכה,",
+    "מערכת סבן שטח",
+  ].filter((line, idx, arr) => line !== "" || (idx > 0 && arr[idx - 1] !== ""));
+  return { subject, text: lines.join("\n") };
 }
 
-function buildMimeEmailWithAttachment(opts: {
-  from: string;
-  to: string;
-  subject: string;
-  text: string;
-  attachment?: { fileName: string; mimeType: string; base64: string };
-}): string {
-  const encodedSubject = `=?UTF-8?B?${bytesToBase64(new TextEncoder().encode(opts.subject))}?=`;
-  if (!opts.attachment) {
-    return [
-      `From: ${opts.from}`,
-      `To: ${opts.to}`,
-      `Subject: ${encodedSubject}`,
-      "MIME-Version: 1.0",
-      "Content-Type: text/plain; charset=UTF-8",
-      "",
-      opts.text,
-    ].join("\r\n");
-  }
-
-  const boundary = `saban_mail_${crypto.randomUUID()}`;
-  return [
-    `From: ${opts.from}`,
-    `To: ${opts.to}`,
-    `Subject: ${encodedSubject}`,
-    "MIME-Version: 1.0",
-    `Content-Type: multipart/mixed; boundary="${boundary}"`,
-    "",
-    `--${boundary}`,
-    "Content-Type: text/plain; charset=UTF-8",
-    "",
-    opts.text,
-    "",
-    `--${boundary}`,
-    `Content-Type: ${opts.attachment.mimeType}; name="${opts.attachment.fileName}"`,
-    "Content-Transfer-Encoding: base64",
-    `Content-Disposition: attachment; filename="${opts.attachment.fileName}"`,
-    "",
-    opts.attachment.base64,
-    `--${boundary}--`,
-  ].join("\r\n");
-}
-
-async function sendEmailNotification(
-  creds: ServiceAccountCreds,
+export async function sendResendEmail(
   env: SyncEnv | undefined,
   opts: {
     to: string;
     subject: string;
     text: string;
-    driveUrl: string | null;
-    attachment?: { fileName: string; mimeType: string; base64: string };
+    attachment?: { fileName: string; base64: string };
   },
 ): Promise<boolean> {
   const resendKey = readEnv("RESEND_API_KEY", env);
-  if (resendKey) {
-    const from = readEnv("EMAIL_FROM", env) || "סבן שטח <noreply@saban94.co.il>";
-    const res = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${resendKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from,
-        to: [opts.to],
-        subject: opts.subject,
-        text: opts.text,
-        ...(opts.attachment
-          ? {
-              attachments: [
-                {
-                  filename: opts.attachment.fileName,
-                  content: opts.attachment.base64,
-                },
-              ],
-            }
-          : {}),
-      }),
-    });
-    if (!res.ok) throw new Error(`Resend email failed (${res.status}): ${await res.text()}`);
-    return true;
-  }
+  if (!resendKey) return false;
 
-  const emailWebhook = readEnv("EMAIL_WEBHOOK_URL", env);
-  if (emailWebhook) {
-    const safeUrl = validateSafeWebhookUrl(emailWebhook);
-    const secret = readEnv("EMAIL_WEBHOOK_SECRET", env);
-    const res = await fetch(safeUrl.toString(), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(secret ? { Authorization: `Bearer ${secret}` } : {}),
-      },
-      body: JSON.stringify({
-        to: opts.to,
-        subject: opts.subject,
-        text: opts.text,
-        driveUrl: opts.driveUrl,
-        ...(opts.attachment ? { attachment: opts.attachment } : {}),
-      }),
-    });
-    if (!res.ok) throw new Error(`Email webhook failed (${res.status}): ${await res.text()}`);
-    return true;
-  }
-
-  const gmailSender = readEnv("GMAIL_SENDER_EMAIL", env);
-  if (gmailSender) {
-    const gmailToken = await getGoogleAccessToken(
-      creds,
-      ["https://www.googleapis.com/auth/gmail.send"],
-      gmailSender,
-    );
-    const rawMime = buildMimeEmailWithAttachment({
-      from: gmailSender,
-      to: opts.to,
-      subject: opts.subject,
-      text: opts.text,
-      ...(opts.attachment ? { attachment: opts.attachment } : {}),
-    });
-    const raw = utf8ToBase64Url(rawMime);
-    const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${gmailToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ raw }),
-    });
-    if (!res.ok) throw new Error(`Gmail API send failed (${res.status}): ${await res.text()}`);
-    return true;
-  }
-
-  return false;
-}
-
-async function sendWhatsAppWebhook(
-  env: SyncEnv | undefined,
-  opts: {
-    message: string;
-    docNumber: string | null | undefined;
-    driver: string;
-    truck: string;
-    driveUrl: string | null;
-  },
-): Promise<boolean> {
-  const webhookUrl = readEnv("WHATSAPP_WEBHOOK_URL", env);
-  if (!webhookUrl) return false;
-  const safeUrl = validateSafeWebhookUrl(webhookUrl);
-  const token = readEnv("WHATSAPP_WEBHOOK_TOKEN", env);
-  const groupId = readEnv("WHATSAPP_GROUP_ID", env) || "עדכונים מהסידור";
-
-  const res = await fetch(safeUrl.toString(), {
+  const from = readEnv("EMAIL_FROM", env) || DEFAULT_EMAIL_FROM;
+  const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
+      Authorization: `Bearer ${resendKey}`,
       "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify({
-      groupId,
-      chatName: "עדכונים מהסידור",
-      message: opts.message,
-      docNumber: opts.docNumber ?? null,
-      driver: opts.driver,
-      truck: opts.truck,
-      driveUrl: opts.driveUrl,
+      from,
+      to: [opts.to],
+      subject: opts.subject,
+      text: opts.text,
+      ...(opts.attachment
+        ? {
+            attachments: [
+              {
+                filename: opts.attachment.fileName,
+                content: opts.attachment.base64,
+              },
+            ],
+          }
+        : {}),
     }),
   });
   if (!res.ok) {
-    throw new Error(`WhatsApp webhook failed (${res.status}): ${await res.text()}`);
+    throw new Error(`Resend email failed (${res.status}): ${await res.text()}`);
   }
   return true;
 }
@@ -743,6 +637,50 @@ export async function processSyncPayload(
     }
   }
 
+  const appsScriptUrl = readEnv("APPS_SCRIPT_URL", runtimeEnv);
+  if (appsScriptUrl) {
+    const safeUrl = validateSafeWebhookUrl(appsScriptUrl);
+    const res = await fetch(safeUrl.toString(), {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    let remote: Partial<SyncResult> | null = null;
+    try {
+      remote = JSON.parse(text) as Partial<SyncResult>;
+    } catch {
+      remote = null;
+    }
+    if (!res.ok || remote?.ok === false) {
+      return {
+        status: res.ok ? 502 : res.status,
+        body: {
+          ok: false,
+          driveUrl: null,
+          duplicate: false,
+          sheet: targetSheet,
+          emailTo,
+          emailSent: false,
+          whatsappSent: false,
+          error: remote?.error || `Apps Script HTTP ${res.status}`,
+        },
+      };
+    }
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        driveUrl: remote?.driveUrl ?? null,
+        duplicate: Boolean(remote?.duplicate),
+        sheet: remote?.sheet || targetSheet,
+        emailTo: remote?.emailTo || emailTo,
+        emailSent: Boolean(remote?.emailSent),
+        whatsappSent: false,
+      },
+    };
+  }
+
   const rawSa = readEnv("GOOGLE_SERVICE_ACCOUNT_JSON", runtimeEnv);
   if (!rawSa) {
     return {
@@ -777,6 +715,13 @@ export async function processSyncPayload(
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/spreadsheets",
       ]);
+      const oauthClientId = readEnv("GOOGLE_OAUTH_CLIENT_ID", runtimeEnv);
+      const oauthClientSecret = readEnv("GOOGLE_OAUTH_CLIENT_SECRET", runtimeEnv);
+      const oauthRefreshToken = readEnv("GOOGLE_OAUTH_REFRESH_TOKEN", runtimeEnv);
+      const driveToken =
+        oauthClientId && oauthClientSecret && oauthRefreshToken
+          ? await getUserOAuthAccessToken(oauthClientId, oauthClientSecret, oauthRefreshToken)
+          : token;
 
       const sheetId = readEnv("SHEET_ID_MAIN", runtimeEnv) || SHEET_ID_MAIN;
       await ensureSheetTabExists(token, sheetId, targetSheet);
@@ -798,7 +743,7 @@ export async function processSyncPayload(
       }
 
       let driveUrl: string | null = null;
-      let attachment: { fileName: string; mimeType: string; base64: string } | undefined;
+      let attachment: { fileName: string; base64: string } | undefined;
 
       const mediaSource = payload.pdf || payload.photo || payload.payment?.receipt;
       if (mediaSource) {
@@ -809,56 +754,40 @@ export async function processSyncPayload(
           payload.fileName ||
           `${payload.kind}_${payload.truck}_${jerusalemDate()}.${isPdf ? "pdf" : "jpg"}`;
         const folderId = await resolveOrCreateDriveFolder(
-          token,
+          driveToken,
           payload.folder || DRIVE_FOLDER,
           readEnv("DRIVE_FOLDER_ID", runtimeEnv),
         );
         const uploaded = await uploadFileToDrive(
-          token,
+          driveToken,
           fileName,
           fileData.mimeType,
           fileData.bytes,
           folderId,
         );
         driveUrl = uploaded.driveUrl;
-        attachment = { fileName, mimeType: fileData.mimeType, base64: fileData.base64 };
+        attachment = { fileName, base64: fileData.base64 };
       }
 
       const row = buildSheetRow(payload, driveUrl, emailTo);
       await appendSheetRow(token, sheetId, targetSheet, row);
 
-      const copy = buildNotificationCopy(payload, driver, driveUrl);
       let emailSent = false;
       let emailError: string | undefined;
-      if (payload.kind === "pod" || payload.kind === "tacho" || payload.notify?.email) {
+      if (payload.kind === "pod" || payload.kind === "tacho") {
+        const copy = buildNotificationCopy(payload, driver, driveUrl);
+        // POD attaches the PDF; tacho uses the Drive link (attaching only if no Drive URL exists)
+        const shouldAttach = payload.kind === "pod" || !driveUrl;
         try {
-          emailSent = await sendEmailNotification(creds, runtimeEnv, {
+          emailSent = await sendResendEmail(runtimeEnv, {
             to: emailTo,
             subject: copy.subject,
             text: copy.text,
-            driveUrl,
-            ...(attachment ? { attachment } : {}),
+            ...(shouldAttach && attachment ? { attachment } : {}),
           });
         } catch (err) {
           emailError = err instanceof Error ? err.message : String(err);
-          console.error("[/api/sync] email notification failed:", emailError);
-        }
-      }
-
-      let whatsappSent = false;
-      let whatsappError: string | undefined;
-      if (payload.notify?.whatsapp && (payload.kind === "pod" || payload.kind === "tacho")) {
-        try {
-          whatsappSent = await sendWhatsAppWebhook(runtimeEnv, {
-            message: copy.text,
-            docNumber: payload.docNumber,
-            driver,
-            truck: payload.truck,
-            driveUrl,
-          });
-        } catch (err) {
-          whatsappError = err instanceof Error ? err.message : String(err);
-          console.error("[/api/sync] whatsapp notification failed:", whatsappError);
+          console.error("[/api/sync] Resend email failed:", emailError);
         }
       }
 
@@ -872,8 +801,7 @@ export async function processSyncPayload(
           emailTo,
           emailSent,
           ...(emailError ? { emailError } : {}),
-          whatsappSent,
-          ...(whatsappError ? { whatsappError } : {}),
+          whatsappSent: false,
         },
       };
     } catch (err) {
@@ -928,10 +856,12 @@ export interface SyncDiagnostics {
     folderName: string;
     accessOk: boolean;
     folderFound?: boolean;
+    isSharedDrive?: boolean;
     error?: string;
   };
   notifications: {
-    emailProvider: "resend" | "webhook" | "gmail" | "none";
+    emailProvider: "resend" | "none";
+    emailFrom: string;
     whatsappConfigured: boolean;
     managerOverrideConfigured: boolean;
   };
@@ -945,11 +875,7 @@ export async function getSyncDiagnostics(runtimeEnv?: SyncEnv): Promise<SyncDiag
     runtimeEnv,
   )
     ? "resend"
-    : readEnv("EMAIL_WEBHOOK_URL", runtimeEnv)
-      ? "webhook"
-      : readEnv("GMAIL_SENDER_EMAIL", runtimeEnv)
-        ? "gmail"
-        : "none";
+    : "none";
 
   const out: SyncDiagnostics = {
     ok: false,
@@ -968,7 +894,8 @@ export async function getSyncDiagnostics(runtimeEnv?: SyncEnv): Promise<SyncDiag
     },
     notifications: {
       emailProvider,
-      whatsappConfigured: Boolean(readEnv("WHATSAPP_WEBHOOK_URL", runtimeEnv)),
+      emailFrom: readEnv("EMAIL_FROM", runtimeEnv) || DEFAULT_EMAIL_FROM,
+      whatsappConfigured: false,
       managerOverrideConfigured: Boolean(readEnv("MANAGER_OVERRIDE_CODE", runtimeEnv)),
     },
   };
@@ -1028,7 +955,7 @@ export async function getSyncDiagnostics(runtimeEnv?: SyncEnv): Promise<SyncDiag
   try {
     if (folderId) {
       const fRes = await fetch(
-        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(folderId)}?fields=id,name,capabilities(canAddChildren)&supportsAllDrives=true`,
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(folderId)}?fields=id,name,driveId,capabilities(canAddChildren)&supportsAllDrives=true`,
         { headers: { Authorization: `Bearer ${token}` } },
       );
       if (!fRes.ok) {
@@ -1036,14 +963,25 @@ export async function getSyncDiagnostics(runtimeEnv?: SyncEnv): Promise<SyncDiag
       } else {
         const fData = (await fRes.json()) as {
           name?: string;
+          driveId?: string;
           capabilities?: { canAddChildren?: boolean };
         };
         out.drive.accessOk = true;
         out.drive.folderFound = true;
+        out.drive.isSharedDrive = Boolean(fData.driveId);
         if (fData.name) out.drive.folderName = fData.name;
+        const hasOAuthDrive = Boolean(
+          readEnv("GOOGLE_OAUTH_CLIENT_ID", runtimeEnv) &&
+          readEnv("GOOGLE_OAUTH_CLIENT_SECRET", runtimeEnv) &&
+          readEnv("GOOGLE_OAUTH_REFRESH_TOKEN", runtimeEnv),
+        );
+        const hasAppsScript = Boolean(readEnv("APPS_SCRIPT_URL", runtimeEnv));
         if (fData.capabilities?.canAddChildren === false) {
           out.drive.error =
             "Service Account lacks write permission (canAddChildren=false) on DRIVE_FOLDER_ID";
+        } else if (!fData.driveId && !hasOAuthDrive && !hasAppsScript) {
+          out.drive.error =
+            "DRIVE_FOLDER_ID is in My Drive (not a Shared Drive). Service Accounts have 0 GB storage quota; move folder to a Shared Drive, set GOOGLE_OAUTH_* refresh token, or deploy apps-script/Code.gs.";
         }
       }
     } else {

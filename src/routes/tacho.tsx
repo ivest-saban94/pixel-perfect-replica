@@ -33,14 +33,14 @@ function Tacho() {
       await enqueue("tacho", `tacho-open|${f.truck!.id}|${date}`, {
         type: "open", truck: f.truck!.id, driver: f.truck!.driver, odometer: n, photo,
         fileName: `tacho_open_${f.truck!.id}_${date}.jpg`, folder: DRIVE_FOLDER, at: now,
-        sheetId: SHEET_ID_MAIN, sheet: "ארכיון_טכוגרף", notify: { whatsapp: true, email: emailForTruck(f.truck!.id) },
+        sheetId: SHEET_ID_MAIN, sheet: "ארכיון_טכוגרף", notify: { email: emailForTruck(f.truck!.id) },
       });
     } else {
       f.setDay({ ...f.day!, closeOdo: n, closePhoto: photo, closeAt: now });
       await enqueue("tacho", `tacho-close|${f.truck!.id}|${date}`, {
         type: "close", truck: f.truck!.id, driver: f.truck!.driver, odometer: n, km, photo,
         fileName: `tacho_close_${f.truck!.id}_${date}.jpg`, folder: DRIVE_FOLDER, at: now,
-        sheetId: SHEET_ID_MAIN, sheet: "ארכיון_טכוגרף", notify: { whatsapp: true, email: emailForTruck(f.truck!.id) },
+        sheetId: SHEET_ID_MAIN, sheet: "ארכיון_טכוגרף", notify: { email: emailForTruck(f.truck!.id) },
       });
     }
     f.confirm(); setTimeout(() => nav({ to: "/" }), 700);

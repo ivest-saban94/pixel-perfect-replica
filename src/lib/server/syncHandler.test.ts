@@ -1,10 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
+  buildNotificationCopy,
+  buildSheetRow,
   getSyncDiagnostics,
   handleSyncRequest,
   parseDataUri,
   processSyncPayload,
   resolveSheetTab,
+  sendResendEmail,
   validateSafeWebhookUrl,
 } from "./syncHandler";
 
@@ -61,6 +64,113 @@ describe("syncHandler", () => {
     expect(res.body.emailTo).toBe("galya@saban94.co.il");
   });
 
+  it("builds exact Hebrew POD notification copy", () => {
+    const copy = buildNotificationCopy(
+      {
+        kind: "pod",
+        key: "1234|20261125",
+        truck: "615-41-002",
+        docNumber: "1234",
+        customer: "כהן בניה",
+        tons: 8.5,
+      },
+      "חכמת גאבר",
+      "https://drive.google.com/file/d/abc/view",
+    );
+    expect(copy.subject).toBe("תעודת משלוח 1234 · כהן בניה · חכמת גאבר");
+    expect(copy.text).toContain("שלום,\nמצורפת תעודת משלוח לעיונך.");
+    expect(copy.text).toContain("📄 מספר תעודה: 1234");
+    expect(copy.text).toContain("👤 לקוח: כהן בניה");
+    expect(copy.text).toContain("🚚 משאית: 615-41-002 (חכמת גאבר)");
+    expect(copy.text).toContain("⚖️ משקל: 8.5 טון");
+    expect(copy.text).toContain("🔗 קישור לדרייב: https://drive.google.com/file/d/abc/view");
+    expect(copy.text).toContain("בברכה,\nמערכת סבן שטח");
+  });
+
+  it("builds exact Hebrew tacho open/close notification copy and sheet row", () => {
+    const openCopy = buildNotificationCopy(
+      {
+        kind: "tacho",
+        key: "tacho-open|651-51-701|20261125",
+        truck: "651-51-701",
+        type: "open",
+        odometer: 120500,
+      },
+      "עלי",
+      "https://drive.google.com/file/d/t1/view",
+    );
+    expect(openCopy.subject).toBe("טכוגרף פתיחת יום · משאית 651-51-701 (עלי)");
+    expect(openCopy.text).toContain("⏱ טכוגרף פתיחת יום");
+    expect(openCopy.text).toContain("🔢 מד אוץ: 120500");
+    expect(openCopy.text).not.toContain("ק״מ היום");
+    expect(openCopy.text).toContain(
+      "🔗 צפייה בצילום הדיסקית: https://drive.google.com/file/d/t1/view",
+    );
+
+    const closePayload = {
+      kind: "tacho" as const,
+      key: "tacho-close|651-51-701|20261125",
+      truck: "651-51-701",
+      type: "close" as const,
+      odometer: 120650,
+      km: 150,
+      at: new Date("2026-11-24T23:30:00Z").getTime(),
+    };
+    const closeCopy = buildNotificationCopy(
+      closePayload,
+      "עלי",
+      "https://drive.google.com/file/d/t2/view",
+    );
+    expect(closeCopy.subject).toBe("טכוגרף סגירת יום · משאית 651-51-701 (עלי)");
+    expect(closeCopy.text).toContain("📏 ק״מ היום: 150");
+
+    const row = buildSheetRow(
+      closePayload,
+      "https://drive.google.com/file/d/t2/view",
+      "lina@saban94.co.il",
+    );
+    expect(row[0]).toBe("tacho-close|651-51-701|20261125");
+    expect(row[1]).toBe("20261125");
+    expect(row[3]).toBe("651-51-701");
+    expect(row[4]).toBe("עלי");
+    expect(row[5]).toBe("close");
+    expect(row[6]).toBe(120650);
+    expect(row[7]).toBe(150);
+    expect(row[8]).toBe("https://drive.google.com/file/d/t2/view");
+    expect(row[9]).toBe("lina@saban94.co.il");
+  });
+
+  it("returns false when RESEND_API_KEY is unset and posts to Resend API when configured", async () => {
+    const skipped = await sendResendEmail(
+      {},
+      { to: "galya@saban94.co.il", subject: "test", text: "body" },
+    );
+    expect(skipped).toBe(false);
+
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ id: "email_123" }), { status: 200 }));
+    const sent = await sendResendEmail(
+      { RESEND_API_KEY: "re_test_key", EMAIL_FROM: "סבן שטח <onboarding@resend.dev>" },
+      {
+        to: "lina@saban94.co.il",
+        subject: "תעודת משלוח 1",
+        text: "גוף",
+        attachment: { fileName: "1.pdf", base64: "JVBERi0=" },
+      },
+    );
+    expect(sent).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "https://api.resend.com/emails",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          Authorization: "Bearer re_test_key",
+        }),
+      }),
+    );
+  });
+
   it("rejects unsafe internal webhook URLs", () => {
     expect(() => validateSafeWebhookUrl("http://127.0.0.1:8080/hook")).toThrow();
     expect(() => validateSafeWebhookUrl("http://169.254.169.254/latest/meta-data")).toThrow();
@@ -93,6 +203,7 @@ describe("syncHandler", () => {
     expect(diag.ok).toBe(false);
     expect(diag.serviceAccount.configured).toBe(false);
     expect(diag.serviceAccount.oauthTokenOk).toBe(false);
+    expect(diag.notifications.emailProvider).toBe("none");
     expect(diag.sheets.sheetId).toBe("1FsLseQrKbIj_AvlE6-dW4J12Gr88P3uaoFVBjEcUjsw");
   });
 });
